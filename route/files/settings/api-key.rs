@@ -1,0 +1,1 @@
+petal::route_file!(spec: petal::write_spec().caps(&["bloom:store"]), read: |_ctx: &petal::Ctx| crate::workflow::read_api_key_route(), write: |_ctx: &petal::Ctx, body: &[u8]| crate::workflow::write_api_key_route(body));

@@ -1,0 +1,25 @@
+[package]
+name = "bloom-near-intents-v2-route"
+version = "0.1.0"
+edition = "2024"
+publish = false
+[workspace]
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+alloy = { version = "2", default-features = false, features = ["dyn-abi", "sol-types", "std"] }
+bs58 = "0.5"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+hex = "0.4"
+petal = { path = "../petal" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

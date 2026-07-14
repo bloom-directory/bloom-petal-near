@@ -1,0 +1,32 @@
+schema = "bloom.petal.local-app.v2"
+name = "near-intents"
+
+[source]
+kind = "github"
+repository = "bloom-directory/bloom-petal-near"
+
+[build]
+command = "scripts/build.sh"
+outputs = ["app/near-intents"]
+
+[consent]
+summary = "Request verified NEAR Intents 1Click quotes, stage EVM deposits through Bloom, and track cross-chain swap settlement."
+
+[caps]
+allowed = ["bloom:http", "bloom:store", "bloom:tx.outbox", "bloom:chain", "bloom:vfs.read"]
+
+[[net.allow]]
+binding = "oneclick"
+host = "1click.chaindefuser.com"
+methods = ["get"]
+paths = ["/v0/tokens", "/v0/status"]
+
+[[net.allow]]
+binding = "oneclick"
+host = "1click.chaindefuser.com"
+methods = ["post"]
+paths = ["/v0/quote", "/v0/deposit/submit"]
+
+[store]
+namespaces = ["state"]
+secret_namespaces = ["secrets"]
