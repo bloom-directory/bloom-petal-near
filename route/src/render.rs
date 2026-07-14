@@ -153,6 +153,9 @@ pub fn sanitize_outbox_receipt_value(value: &serde_json::Value) -> Option<serde_
         input,
         &mut output,
         &[
+            "outcome",
+            "tx_hash",
+            "revert_reason",
             "transactionHash",
             "blockHash",
             "blockNumber",
@@ -166,6 +169,15 @@ pub fn sanitize_outbox_receipt_value(value: &serde_json::Value) -> Option<serde_
             "type",
         ],
     );
+    if let Some(value) = input.get("block_number").filter(|value| value.is_u64()) {
+        output.insert("block_number".into(), value.clone());
+    }
+    if input
+        .get("revert_reason")
+        .is_some_and(|value| value.is_null())
+    {
+        output.insert("revert_reason".into(), serde_json::Value::Null);
+    }
     Some(output.into())
 }
 
@@ -196,11 +208,14 @@ mod tests {
         assert!(!text.contains("secret"));
 
         let receipt = sanitize_outbox_receipt(
-            r#"{"transactionHash":"0xabc","status":"0x1","logs":[{"data":"secret"}],"unknown":"no"}"#,
+            r#"{"outcome":"success","tx_hash":"0xabc","block_number":42,"revert_reason":null,"logs":[{"data":"secret"}],"unknown":"no"}"#,
         )
         .unwrap();
         let text = receipt.to_string();
-        assert!(text.contains("transactionHash"));
+        assert!(text.contains("\"outcome\":\"success\""));
+        assert!(text.contains("\"tx_hash\":\"0xabc\""));
+        assert!(text.contains("\"block_number\":42"));
+        assert!(text.contains("\"revert_reason\":null"));
         assert!(!text.contains("logs"));
         assert!(!text.contains("unknown"));
     }
