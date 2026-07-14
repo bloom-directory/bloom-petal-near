@@ -19,6 +19,8 @@ pub struct Rebate {
 pub struct QuoteRequest {
     pub dry: bool,
     pub deposit_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insured: Option<bool>,
     pub swap_type: String,
     pub slippage_tolerance: u16,
     pub origin_asset: String,
@@ -103,13 +105,46 @@ pub struct TokenResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionStatus {
     pub correlation_id: String,
-    pub quote_response: QuoteResponse,
+    pub quote_response: StatusQuoteResponse,
     pub status: String,
     pub updated_at: String,
     #[serde(default)]
     pub swap_details: serde_json::Value,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StatusQuoteResponse {
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    pub timestamp: String,
+    pub signature: String,
+    pub quote_request: QuoteRequest,
+    pub quote: Quote,
+}
+
+impl StatusQuoteResponse {
+    pub fn into_verified_shape(
+        self,
+        persisted_quote_correlation_id: &str,
+    ) -> Result<QuoteResponse, String> {
+        if self
+            .correlation_id
+            .as_deref()
+            .is_some_and(|nested| nested != persisted_quote_correlation_id)
+        {
+            return Err("status nested correlationId differs from persisted quote".into());
+        }
+        Ok(QuoteResponse {
+            correlation_id: persisted_quote_correlation_id.into(),
+            timestamp: self.timestamp,
+            signature: self.signature,
+            quote_request: self.quote_request,
+            quote: self.quote,
+        })
+    }
 }
 
 pub fn from_slice_no_duplicates<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
@@ -202,5 +237,28 @@ mod tests {
                 .unwrap_err()
                 .contains("duplicate")
         );
+    }
+
+    #[test]
+    fn status_quote_uses_persisted_quote_correlation_and_rejects_conflicts() {
+        let quote = r#"{
+          "timestamp":"2027-01-01T00:00:00Z","signature":"sig",
+          "quoteRequest":{"dry":false,"depositMode":"SIMPLE","swapType":"EXACT_INPUT","slippageTolerance":100,"originAsset":"origin","depositType":"ORIGIN_CHAIN","destinationAsset":"dest","amount":"1","refundTo":"refund","refundType":"ORIGIN_CHAIN","recipient":"recipient","recipientType":"DESTINATION_CHAIN","deadline":"2027-01-01T01:00:00Z"},
+          "quote":{"amountIn":"1","amountInFormatted":"1","amountInUsd":"1","minAmountIn":"1","amountOut":"1","amountOutFormatted":"1","amountOutUsd":"1","minAmountOut":"1","timeEstimate":1}
+        }"#;
+        let status: StatusQuoteResponse = serde_json::from_str(quote).unwrap();
+        assert_eq!(
+            status
+                .into_verified_shape("persisted-quote-correlation")
+                .unwrap()
+                .correlation_id,
+            "persisted-quote-correlation"
+        );
+
+        let conflicting = quote.replacen("{", r#"{"correlationId":"different","#, 1);
+        let status: StatusQuoteResponse = serde_json::from_str(&conflicting).unwrap();
+        assert!(status
+            .into_verified_shape("persisted-quote-correlation")
+            .is_err());
     }
 }

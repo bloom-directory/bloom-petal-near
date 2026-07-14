@@ -145,6 +145,9 @@ The Petal sends the following quote fields:
 
 The Petal omits `appFees`, `rebates`, `insured`, `confidentiality`,
 `customRecipientMsg`, virtual-chain fields, and all account/session fields.
+The live API may echo an omitted `insured` request field as `false`. The Petal
+accepts absent or `false` because `insured` is excluded from the official SDK's
+signed projection, but rejects `true` as unsupported execution metadata.
 The unknown-field policy in section 4.3 controls schema evolution; retaining
 raw response evidence does not make an unknown field acceptable for execution.
 
@@ -382,8 +385,8 @@ upgrade; implicit secret migration is forbidden.
 | `tokens.json` | read | Fetch current 1Click tokens, filter/annotate executable Bloom origins, cache briefly |
 | `settings/api-key` | read/write | Report configured state or persist the JWT without echoing it |
 | `settings/status.json` | read | Report credential presence, endpoint binding, and supported origin mappings |
-| `swaps/<wallet>/new` | read/write | Show input schema or create a quote session asynchronously |
-| `swaps/<wallet>/latest` | read | Return the latest local session ID and path |
+| `swaps/<wallet>/new` | read/write | Show input schema or synchronously create the caller-named quote session |
+| `swaps/<wallet>/latest` | read | Convenience pointer only; agents must use their caller-supplied session ID |
 | `request.json` | read | Canonical user request plus derived origin/refund fields |
 | `quote.json` | read | Redacted complete quote, signature, verification result, and hash |
 | `review_intent.json` | read | Stable machine-readable action reviewed by the user |
@@ -397,8 +400,10 @@ upgrade; implicit secret migration is forbidden.
 | `refresh` | write | Inspect the outbox, submit a mined tx hash once, and poll 1Click status |
 | `abandon` | write | Mark a pre-deposit session abandoned; cannot cancel an on-chain deposit |
 
-`new`, `confirm`, `refresh`, and `abandon` must be async write routes and must
-persist errors for later inspection in `status.json`.
+`new`, `confirm`, `refresh`, and `abandon` are synchronous write routes. A
+successful write means its one durable state transition is visible through
+`status.json` before the write returns. This read-after-write guarantee avoids
+racing `latest` or guessing whether an asynchronous job finished.
 
 ## 9. User input
 
@@ -406,6 +411,7 @@ persist errors for later inspection in `status.json`.
 
 ```json
 {
+  "session_id": "agent-20260714-0001",
   "swap_type": "EXACT_INPUT",
   "origin_asset": "nep141:arb-0x....omft.near",
   "destination_asset": "nep141:sol-....omft.near",
@@ -420,6 +426,10 @@ persist errors for later inspection in `status.json`.
 
 Rules:
 
+- `session_id` is caller-generated, 8..=64 ASCII letters, digits, hyphens, or
+  underscores. It is reserved with `put-new` before any upstream quote request;
+  reuse is rejected before another side effect. Agents address the session by
+  this ID and never depend on `latest` for correctness.
 - `swap_type` is `EXACT_INPUT` or `EXACT_OUTPUT`.
 - `amount` is a canonical positive integer string with no sign, decimal point,
   exponent, or leading zeros except the value `0`; zero is rejected.
@@ -482,8 +492,8 @@ presence, and decimals must be prominent in `plan.md` and
 
 1. Validate the local request without network side effects.
 2. Resolve and persist the wallet, chain, and origin token record.
-3. Allocate an unpredictable session ID using `bloom:env/random-bytes`.
-4. Acquire a `put-new` session lock and persist state `quoting`.
+3. Reserve the caller-supplied session ID with `put-new` before network work.
+4. Acquire the per-session lock and persist state `quoting`.
 5. Load the partner JWT from the secret namespace.
 6. POST the constrained quote request.
 7. Bound and parse the response; retain the original response JSON bytes.
@@ -661,17 +671,30 @@ the Petal refuses automatic restaging and reports manual recovery instructions.
 
 1. Inspect the owned Bloom outbox entry when one exists.
 2. Persist its state, tx hash, and sanitized receipt.
-3. If the outbox has a mined/sent tx hash and no successful submit receipt,
+3. If the outbox has no transaction hash yet, return without polling 1Click;
+   the executable local state remains unchanged.
+4. If the outbox has a mined/sent tx hash and no successful submit receipt,
    atomically claim a submit lock, POST `/v0/deposit/submit`, and persist the
    response. A timeout after sending is marked `submit_ambiguous`; retrying is
    permitted because submission is advisory and keyed by deposit address plus
    tx hash, but the ambiguity is retained in history.
-4. GET `/v0/status` with the exact persisted deposit address.
-5. Verify the embedded `quoteResponse` signature and require it to match the
+5. GET `/v0/status` with the exact persisted deposit address.
+6. Verify the embedded `quoteResponse` signature and require it to match the
    persisted quote correlation ID, deposit address, asset pair, recipient, and
-   refund address.
-6. Persist the upstream state and sanitized `swapDetails`.
-7. Render `receipt.json` when upstream status is terminal.
+   refund address. Live status responses may omit `quoteResponse.correlationId`
+   while retaining the envelope `correlationId`; because correlation ID is not
+   in the SDK signed projection, reconstruct it only from the envelope. If the
+   nested value is present, require it to equal the envelope value.
+   The live status endpoint may also omit the originally signed nonzero
+   `quoteWaitingTimeMs`; restore only that absent field from the persisted,
+   already verified quote before recomputing the SDK projection. Never
+   overwrite a present status value. Normalized `appFees: []` and omitted
+   `insured` remain outside the SDK signed projection and execution behavior.
+7. Persist the upstream state and sanitized `swapDetails`.
+8. Render `receipt.json` when upstream status is terminal.
+
+HTTP, decoding, signature, or correlation failures update `last_error` but do
+not transition away from the last valid executable state.
 
 `status.json` is a pure read of the last persisted state. It must not poll on
 read.
@@ -766,7 +789,6 @@ preflight_failed
 staging_ambiguous
 deposit_failed
 submit_ambiguous
-status_error
 abandoned
 ```
 
@@ -776,8 +798,8 @@ the external transfer.
 
 ## 18. Idempotency and recovery invariants
 
-1. A session ID identifies one immutable quote and one immutable prepared EVM
-   transaction.
+1. A caller-supplied session ID identifies one immutable quote and one
+   immutable prepared EVM transaction; it is reserved before network work.
 2. A session owns at most one outbox ID.
 3. Once an outbox ID exists, the component never calls `tx_stage` again.
 4. Once an origin tx hash exists, the component never confirms another outbox

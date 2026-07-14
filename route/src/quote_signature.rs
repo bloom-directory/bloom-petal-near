@@ -163,6 +163,15 @@ mod tests {
     }
 
     #[test]
+    fn upstream_insured_default_is_not_in_the_sdk_signed_projection() {
+        let mut q: QuoteResponse = serde_json::from_str(FIXTURE).unwrap();
+        let original = signed_projection(&q);
+        q.quote_request.insured = Some(false);
+        assert_eq!(signed_projection(&q), original);
+        assert!(signed_projection(&q).get("insured").is_none());
+    }
+
+    #[test]
     fn tampering_and_bad_lengths_fail_closed() {
         let mut q: QuoteResponse = serde_json::from_str(FIXTURE).unwrap();
         q.quote.deposit_address = Some("tampered".into());

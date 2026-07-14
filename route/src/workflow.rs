@@ -329,6 +329,7 @@ fn validate_echo(
         return Err("quote is not an executable origin-chain quote".into());
     }
     if r.deposit_mode.as_deref() != Some("SIMPLE")
+        || r.insured.unwrap_or(false)
         || r.connected_wallets.as_ref().is_some_and(|v| !v.is_empty())
         || r.session_id.is_some()
         || r.virtual_chain_recipient.is_some()
@@ -499,12 +500,18 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
         .ok_or("origin asset not found")?;
     let origin = assets::resolve(&tokens, &req.origin_asset)?;
     let now = host.now_ms();
-    let id = hex::encode(host.random(16)?);
+    let id = req.session_id.clone();
+    let reservation = format!("swaps/{wallet}/{id}/reservation");
+    host.put_new(&reservation, &Sha256::digest(body), false)
+        .map_err(|_| {
+            "session_id already exists; inspect the existing session instead".to_string()
+        })?;
     let lock = format!("locks/swaps/{wallet}/{id}");
     let lock_token = acquire_lock(host, &lock, 60_000)?;
     let sent = QuoteRequest {
         dry: false,
         deposit_mode: Some("SIMPLE".into()),
+        insured: None,
         swap_type: req.swap_type.clone(),
         slippage_tolerance: req.slippage_bps,
         origin_asset: req.origin_asset.clone(),
@@ -775,9 +782,14 @@ fn refresh_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
     if s.terminal() {
         return Ok(());
     }
-    if s.outbox_id.is_some() {
+    if s.outbox_id.is_some() && s.origin_tx_hash.is_none() {
         inspect_outbox(host, &mut s)?;
         s = load(host, wallet, id)?;
+        if s.origin_tx_hash.is_none() {
+            s.last_error = None;
+            save(host, &s)?;
+            return Ok(());
+        }
     }
     let jwt = jwt(host)?;
     if let Some(hash) = s.origin_tx_hash.clone()
@@ -816,46 +828,46 @@ fn refresh_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
         Ok(value) => value,
         Err(e) => {
             s.last_error = Some(crate::redaction::sanitize_message(&e));
-            s.transition(
-                host.now_ms(),
-                "status_error",
-                "1Click status request failed",
-            );
             save(host, &s)?;
             return Err(e);
         }
     };
     host.put(&format!("swaps/{wallet}/{id}/status.raw.json"), &raw, false)?;
-    let hash = match verifier(&status.quote_response) {
+    let mut status_quote = match status
+        .quote_response
+        .into_verified_shape(&s.quote.correlation_id)
+    {
+        Ok(quote) => quote,
+        Err(e) => {
+            s.last_error = Some(e.clone());
+            save(host, &s)?;
+            return Err(e);
+        }
+    };
+    if status_quote.quote_request.quote_waiting_time_ms.is_none() {
+        status_quote.quote_request.quote_waiting_time_ms =
+            s.quote.quote_request.quote_waiting_time_ms;
+    }
+    let hash = match verifier(&status_quote) {
         Ok(hash) => hash,
         Err(e) => {
             s.last_error = Some(crate::redaction::sanitize_message(&e));
-            s.transition(
-                host.now_ms(),
-                "status_error",
-                "status quote signature failed",
-            );
             save(host, &s)?;
             return Err(format!("status quote: {e}"));
         }
     };
     if hash != s.quote_hash
-        || status.correlation_id != s.quote.correlation_id
-        || status.quote_response.quote.deposit_address != s.quote.quote.deposit_address
-        || status.quote_response.quote_request.recipient != s.quote.quote_request.recipient
-        || status.quote_response.quote_request.refund_to != s.quote.quote_request.refund_to
+        || status_quote.quote.deposit_address != s.quote.quote.deposit_address
+        || status_quote.quote_request.recipient != s.quote.quote_request.recipient
+        || status_quote.quote_request.refund_to != s.quote.quote_request.refund_to
     {
         s.last_error = Some("status response does not correlate to persisted quote".into());
-        s.transition(
-            host.now_ms(),
-            "status_error",
-            "status response correlation failed",
-        );
         save(host, &s)?;
         return Err("status response does not correlate to persisted quote".into());
     }
     s.upstream_status = Some(status.status.clone());
     s.swap_details = Some(status.swap_details);
+    s.last_error = None;
     let next = match status.status.as_str() {
         "SUCCESS" => "settled_success",
         "REFUNDED" => "settled_refunded",
@@ -901,9 +913,15 @@ mod workflow_tests {
         stage_calls: usize,
         confirm_calls: usize,
         submit_calls: usize,
+        quote_calls: usize,
+        status_calls: usize,
         erc20: bool,
         stage_fails: bool,
         corrupt_signature: bool,
+        response_insured: Option<bool>,
+        inspect_pending: bool,
+        malformed_status: bool,
+        inspect_denied: bool,
     }
 
     #[derive(Clone)]
@@ -978,6 +996,7 @@ mod workflow_tests {
                     serde_json::to_vec(&vec![serde_json::json!({"assetId":"nep141:eth.omft.near","decimals":18,"blockchain":"eth","symbol":"ETH","price":1000.0,"priceUpdatedAt":"2027-01-15T08:00:00Z","contractAddress":contract})]).unwrap()
                 }
                 ("POST", "/v0/quote") => {
+                    self.0.borrow_mut().quote_calls += 1;
                     assert!(
                         req.headers
                             .iter()
@@ -985,6 +1004,7 @@ mod workflow_tests {
                     );
                     let request: QuoteRequest = serde_json::from_slice(&req.body).unwrap();
                     let mut quote = signed_quote(request);
+                    quote.quote_request.insured = self.0.borrow().response_insured;
                     if self.0.borrow().corrupt_signature {
                         quote.signature = "ed25519:1".into();
                     }
@@ -996,8 +1016,27 @@ mod workflow_tests {
                     b"{}".to_vec()
                 }
                 ("GET", "/v0/status") => {
+                    self.0.borrow_mut().status_calls += 1;
+                    if self.0.borrow().malformed_status {
+                        return Ok(HttpResponse {
+                            status: 200,
+                            headers: vec![],
+                            body: br#"{"message":"deposit not known yet"}"#.to_vec(),
+                        });
+                    }
                     let q = self.0.borrow().last_quote.clone().unwrap();
-                    serde_json::to_vec(&serde_json::json!({"correlationId":q.correlation_id,"quoteResponse":q,"status":"SUCCESS","updatedAt":"2027-01-15T08:01:00Z","swapDetails":{"intentHashes":["intent"],"nearTxHashes":["near"],"originChainTxHashes":[],"destinationChainTxHashes":[]}})).unwrap()
+                    let mut status_quote = serde_json::to_value(&q).unwrap();
+                    let status_quote = status_quote.as_object_mut().unwrap();
+                    status_quote.remove("correlationId");
+                    let status_request = status_quote
+                        .get_mut("quoteRequest")
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap();
+                    status_request.remove("quoteWaitingTimeMs");
+                    status_request.remove("insured");
+                    status_request.insert("appFees".into(), serde_json::json!([]));
+                    serde_json::to_vec(&serde_json::json!({"correlationId":q.correlation_id,"quoteResponse":status_quote,"status":"SUCCESS","updatedAt":"2027-01-15T08:01:00Z","swapDetails":{"intentHashes":["intent"],"nearTxHashes":["near"],"originChainTxHashes":[],"destinationChainTxHashes":[]}})).unwrap()
                 }
                 _ => return Err(format!("unexpected HTTP {} {}", req.method, path)),
             };
@@ -1093,6 +1132,17 @@ mod workflow_tests {
             })
         }
         fn tx_inspect(&mut self, _: &str, _: &str, id: &str) -> Result<OutboxInspection, String> {
+            if self.0.borrow().inspect_denied {
+                return Err("denied".into());
+            }
+            if self.0.borrow().inspect_pending {
+                return Ok(OutboxInspection {
+                    outbox_id: id.into(),
+                    state: "pending".into(),
+                    tx_hash: None,
+                    receipt_json: None,
+                });
+            }
             Ok(OutboxInspection {
                 outbox_id: id.into(),
                 state: "sent".into(),
@@ -1110,7 +1160,7 @@ mod workflow_tests {
         drop(host);
         let mut restarted = MockHost(shared.clone());
         assert!(credential_status(&mut restarted).unwrap().configured);
-        let request = serde_json::json!({"swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":"recipient-on-destination","deadline_seconds":900});
+        let request = serde_json::json!({"session_id":"test-e2e-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":"recipient-on-destination","deadline_seconds":900});
         let id = create_with_verifier(
             &mut restarted,
             "alice",
@@ -1151,6 +1201,30 @@ mod workflow_tests {
     }
 
     #[test]
+    fn accepts_upstream_insured_false_but_rejects_true() {
+        let request = serde_json::json!({"session_id":"test-insured-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":"recipient-on-destination","deadline_seconds":900});
+
+        for (insured, succeeds) in [(false, true), (true, false)] {
+            let shared = Rc::new(RefCell::new(Shared {
+                response_insured: Some(insured),
+                ..Shared::default()
+            }));
+            let mut host = MockHost(shared);
+            write_api_key(&mut host, JWT.as_bytes()).unwrap();
+            let result = create_with_verifier(
+                &mut host,
+                "alice",
+                &serde_json::to_vec(&request).unwrap(),
+                test_verify,
+            );
+            assert_eq!(result.is_ok(), succeeds);
+            if let Err(error) = result {
+                assert!(error.contains("unsupported execution metadata"));
+            }
+        }
+    }
+
+    #[test]
     fn erc20_workflow_prepares_transfer_to_validated_contract() {
         let shared = Rc::new(RefCell::new(Shared {
             erc20: true,
@@ -1158,7 +1232,7 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared);
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"test-erc20-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
         let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
         confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
         let tx = load(&mut host, "alice", &id)
@@ -1178,7 +1252,7 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"test-ambiguous-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
         let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
         confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
         assert!(confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).is_err());
@@ -1198,15 +1272,95 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared);
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"test-failure-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
         assert!(create_with_verifier(&mut host, "alice", &body, test_verify).is_err());
-        let id = hex::encode([9u8; 16]);
+        let id = "test-failure-session";
         let raw = host
-            .get(&session::failure_key("alice", &id), 65536)
+            .get(&session::failure_key("alice", id), 65536)
             .unwrap()
             .unwrap();
         let text = String::from_utf8(raw).unwrap();
         assert!(text.contains("quote_failed"));
         assert!(!text.contains(JWT));
+    }
+
+    #[test]
+    fn caller_session_id_is_reserved_before_quote_side_effects() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"caller-known-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        assert_eq!(
+            create_with_verifier(&mut host, "alice", &body, test_verify).unwrap(),
+            "caller-known-session"
+        );
+        let error = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap_err();
+        assert!(error.contains("session_id already exists"));
+        assert_eq!(shared.borrow().quote_calls, 1);
+    }
+
+    #[test]
+    fn refresh_does_not_poll_upstream_before_outbox_has_a_hash() {
+        let shared = Rc::new(RefCell::new(Shared {
+            inspect_pending: true,
+            ..Shared::default()
+        }));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"pending-outbox-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
+        confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).unwrap();
+        let session = load(&mut host, "alice", &id).unwrap();
+        assert_eq!(session.state, "staged");
+        assert_eq!(session.outbox_state.as_deref(), Some("pending"));
+        assert!(session.origin_tx_hash.is_none());
+        assert_eq!(shared.borrow().status_calls, 0);
+    }
+
+    #[test]
+    fn upstream_status_errors_do_not_strand_executable_state() {
+        let shared = Rc::new(RefCell::new(Shared {
+            malformed_status: true,
+            ..Shared::default()
+        }));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"status-error-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
+        for _ in 0..3 {
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        }
+        assert!(refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).is_err());
+        let session = load(&mut host, "alice", &id).unwrap();
+        assert_eq!(session.state, "deposit_sent");
+        assert!(session.last_error.is_some());
+        assert_eq!(shared.borrow().status_calls, 1);
+    }
+
+    #[test]
+    fn migrated_sent_session_does_not_reinspect_old_package_outbox() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"migrated-sent-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
+        for _ in 0..3 {
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        }
+        let mut session = load(&mut host, "alice", &id).unwrap();
+        session.origin_tx_hash = Some("0xabc".into());
+        session.outbox_state = Some("success".into());
+        session.state = "deposit_sent".into();
+        save(&mut host, &session).unwrap();
+        shared.borrow_mut().inspect_denied = true;
+
+        refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).unwrap();
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "settled_success"
+        );
+        assert_eq!(shared.borrow().status_calls, 1);
     }
 }

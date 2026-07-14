@@ -13,6 +13,7 @@ fn default_wait() -> u32 {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NewSwapRequest {
+    pub session_id: String,
     pub swap_type: String,
     pub origin_asset: String,
     pub destination_asset: String,
@@ -41,6 +42,16 @@ fn safe(value: &str, max: usize) -> bool {
 
 impl NewSwapRequest {
     pub fn validate(&self) -> Result<(), String> {
+        if !(8..=64).contains(&self.session_id.len())
+            || !self
+                .session_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Err(
+                "session_id must be 8..=64 ASCII letters, digits, hyphens, or underscores".into(),
+            );
+        }
         if !matches!(self.swap_type.as_str(), "EXACT_INPUT" | "EXACT_OUTPUT") {
             return Err("swap_type must be EXACT_INPUT or EXACT_OUTPUT".into());
         }
@@ -84,5 +95,27 @@ mod tests {
         }
         assert!(canonical_amount("1"));
         assert!(canonical_amount("1000000000000000000"));
+    }
+
+    #[test]
+    fn session_ids_are_caller_known_safe_segments() {
+        let valid = NewSwapRequest {
+            session_id: "agent-20260714-0001".into(),
+            swap_type: "EXACT_INPUT".into(),
+            origin_asset: "origin".into(),
+            destination_asset: "destination".into(),
+            amount: "1".into(),
+            recipient: "recipient".into(),
+            slippage_bps: 100,
+            deadline_seconds: 900,
+            quote_waiting_time_ms: 3000,
+            refund_to: None,
+        };
+        assert!(valid.validate().is_ok());
+        for bad in ["short", "contains/slash", "contains space"] {
+            let mut request = valid.clone();
+            request.session_id = bad.into();
+            assert!(request.validate().is_err(), "{bad}");
+        }
     }
 }
