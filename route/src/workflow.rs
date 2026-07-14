@@ -214,14 +214,29 @@ pub fn session_route(wallet: &str, id: &str, field: &str) -> petal::DispatchResp
             .as_ref()
             .map(petal::read_json_value)
             .unwrap_or_else(|| petal::error(-1, "no approval pending")),
-        "outbox" => petal::read_json_value(
-            &serde_json::json!({"id":s.outbox_id,"chain":s.origin.bloom_chain,"state":s.outbox_state,"tx_hash":s.origin_tx_hash,"receipt":s.outbox_receipt}),
-        ),
+        "outbox" => {
+            let receipt = s
+                .outbox_receipt
+                .as_ref()
+                .and_then(render::sanitize_outbox_receipt_value);
+            petal::read_json_value(
+                &serde_json::json!({"id":s.outbox_id,"chain":s.origin.bloom_chain,"state":s.outbox_state,"tx_hash":s.origin_tx_hash,"receipt":receipt}),
+            )
+        }
         "status" => petal::read_json_value(&render::public_status(&s)),
         "receipt" => {
             if s.terminal() && s.state != "abandoned" {
+                let swap_details = s
+                    .swap_details
+                    .as_ref()
+                    .map(render::sanitize_swap_details)
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let outbox_receipt = s
+                    .outbox_receipt
+                    .as_ref()
+                    .and_then(render::sanitize_outbox_receipt_value);
                 petal::read_json_value(
-                    &serde_json::json!({"state":s.state,"origin_tx_hash":s.origin_tx_hash,"outbox_receipt":s.outbox_receipt,"upstream_status":s.upstream_status,"upstream_updated_at":s.upstream_updated_at,"swap_details":s.swap_details,"updated_ms":s.updated_ms}),
+                    &serde_json::json!({"state":s.state,"origin_tx_hash":s.origin_tx_hash,"outbox_receipt":outbox_receipt,"upstream_status":s.upstream_status,"upstream_updated_at":s.upstream_updated_at,"swap_details":swap_details,"updated_ms":s.updated_ms}),
                 )
             } else {
                 petal::error(-1, "terminal receipt not available")

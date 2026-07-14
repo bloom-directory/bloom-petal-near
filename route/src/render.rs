@@ -146,11 +146,7 @@ pub fn sanitize_swap_details(value: &serde_json::Value) -> serde_json::Value {
     output.into()
 }
 
-pub fn sanitize_outbox_receipt(raw: &str) -> Option<serde_json::Value> {
-    if raw.len() > 128 * 1024 {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+pub fn sanitize_outbox_receipt_value(value: &serde_json::Value) -> Option<serde_json::Value> {
     let input = value.as_object()?;
     let mut output = serde_json::Map::new();
     copy_strings(
@@ -171,6 +167,14 @@ pub fn sanitize_outbox_receipt(raw: &str) -> Option<serde_json::Value> {
         ],
     );
     Some(output.into())
+}
+
+pub fn sanitize_outbox_receipt(raw: &str) -> Option<serde_json::Value> {
+    if raw.len() > 128 * 1024 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    sanitize_outbox_receipt_value(&value)
 }
 
 #[cfg(test)]
