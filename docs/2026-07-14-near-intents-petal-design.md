@@ -680,11 +680,14 @@ the Petal refuses automatic restaging and reports manual recovery instructions.
    tx hash, but the ambiguity is retained in history.
 5. GET `/v0/status` with the exact persisted deposit address.
 6. Verify the embedded `quoteResponse` signature and require it to match the
-   persisted quote correlation ID, deposit address, asset pair, recipient, and
-   refund address. Live status responses may omit `quoteResponse.correlationId`
-   while retaining the envelope `correlationId`; because correlation ID is not
-   in the SDK signed projection, reconstruct it only from the envelope. If the
-   nested value is present, require it to equal the envelope value.
+   persisted quote hash, deposit address, asset pair, recipient, and refund
+   address. Live status responses may omit `quoteResponse.correlationId`, and
+   the status envelope `correlationId` is an independent response identifier
+   that can differ from the original quote ID. Because correlation ID is not in
+   the SDK signed projection, reconstruct a missing nested value from the
+   persisted verified quote. If the nested value is present, require it to
+   equal the persisted quote ID. Do not use the envelope response identifier as
+   a quote binding.
    The live status endpoint may also omit the originally signed nonzero
    `quoteWaitingTimeMs`; restore only that absent field from the persisted,
    already verified quote before recomputing the SDK projection. Never
@@ -752,7 +755,9 @@ origin_tx_hash
 approval
 deposit_submit_state
 upstream_status
+upstream_updated_at
 swap_details
+outbox_receipt
 last_error
 history[]
 ```
@@ -760,6 +765,9 @@ history[]
 State transitions are append-recorded in a bounded history with timestamp,
 prior state, next state, and a non-secret reason. Store writes are atomic.
 Locks use `put-new` and compare-and-delete with random ownership tokens.
+Every confirm, refresh, and abandon invocation holds the per-session lock for
+its entire load/side-effect/save transition. This prevents duplicate staging
+and last-writer-wins loss of an outbox ID or transaction hash.
 
 The route must tolerate daemon restart at every persisted state. It must never
 depend on in-memory state for correctness.

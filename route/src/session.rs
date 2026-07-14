@@ -51,9 +51,13 @@ pub struct Session {
     pub outbox_id: Option<String>,
     pub outbox_state: Option<String>,
     pub origin_tx_hash: Option<String>,
+    #[serde(default)]
+    pub outbox_receipt: Option<serde_json::Value>,
     pub approval: Option<serde_json::Value>,
     pub deposit_submit_state: Option<String>,
     pub upstream_status: Option<String>,
+    #[serde(default)]
+    pub upstream_updated_at: Option<String>,
     pub swap_details: Option<serde_json::Value>,
     pub last_error: Option<String>,
     pub history: Vec<History>,

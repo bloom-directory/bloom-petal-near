@@ -18,6 +18,7 @@ pub struct Rebate {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QuoteRequest {
     pub dry: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deposit_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub insured: Option<bool>,
@@ -30,17 +31,27 @@ pub struct QuoteRequest {
     pub refund_to: String,
     pub refund_type: String,
     pub recipient: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connected_wallets: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_chain_recipient: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_chain_refund_recipient: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_recipient_msg: Option<String>,
     pub recipient_type: String,
     pub deadline: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidentiality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub referral: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebates: Option<Vec<Rebate>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote_waiting_time_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_fees: Option<Vec<AppFee>>,
 }
 
@@ -257,8 +268,10 @@ mod tests {
 
         let conflicting = quote.replacen("{", r#"{"correlationId":"different","#, 1);
         let status: StatusQuoteResponse = serde_json::from_str(&conflicting).unwrap();
-        assert!(status
-            .into_verified_shape("persisted-quote-correlation")
-            .is_err());
+        assert!(
+            status
+                .into_verified_shape("persisted-quote-correlation")
+                .is_err()
+        );
     }
 }

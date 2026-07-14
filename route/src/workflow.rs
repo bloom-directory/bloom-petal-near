@@ -215,13 +215,13 @@ pub fn session_route(wallet: &str, id: &str, field: &str) -> petal::DispatchResp
             .map(petal::read_json_value)
             .unwrap_or_else(|| petal::error(-1, "no approval pending")),
         "outbox" => petal::read_json_value(
-            &serde_json::json!({"id":s.outbox_id,"chain":s.origin.bloom_chain,"state":s.outbox_state,"tx_hash":s.origin_tx_hash}),
+            &serde_json::json!({"id":s.outbox_id,"chain":s.origin.bloom_chain,"state":s.outbox_state,"tx_hash":s.origin_tx_hash,"receipt":s.outbox_receipt}),
         ),
         "status" => petal::read_json_value(&render::public_status(&s)),
         "receipt" => {
             if s.terminal() && s.state != "abandoned" {
                 petal::read_json_value(
-                    &serde_json::json!({"state":s.state,"origin_tx_hash":s.origin_tx_hash,"upstream_status":s.upstream_status,"swap_details":s.swap_details,"updated_ms":s.updated_ms}),
+                    &serde_json::json!({"state":s.state,"origin_tx_hash":s.origin_tx_hash,"outbox_receipt":s.outbox_receipt,"upstream_status":s.upstream_status,"upstream_updated_at":s.upstream_updated_at,"swap_details":s.swap_details,"updated_ms":s.updated_ms}),
                 )
             } else {
                 petal::error(-1, "terminal receipt not available")
@@ -262,6 +262,16 @@ fn acquire_lock<H: Host>(host: &mut H, key: &str, ttl_ms: u64) -> Result<Vec<u8>
     let bytes = json(&lock)?;
     host.put_new(key, &bytes, false)?;
     Ok(bytes)
+}
+
+fn finish_locked<T>(result: Result<T, String>, release: Result<(), String>) -> Result<T, String> {
+    match result {
+        Err(error) => Err(error),
+        Ok(value) => {
+            release?;
+            Ok(value)
+        }
+    }
 }
 
 pub fn write_api_key<H: Host>(host: &mut H, body: &[u8]) -> Result<(), String> {
@@ -528,7 +538,7 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
         custom_recipient_msg: None,
         recipient_type: "DESTINATION_CHAIN".into(),
         deadline: iso_deadline(now, req.deadline_seconds)?,
-        confidentiality: Some("public".into()),
+        confidentiality: None,
         referral: None,
         rebates: None,
         quote_waiting_time_ms: Some(req.quote_waiting_time_ms),
@@ -561,9 +571,11 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
             outbox_id: None,
             outbox_state: None,
             origin_tx_hash: None,
+            outbox_receipt: None,
             approval: None,
             deposit_submit_state: None,
             upstream_status: None,
+            upstream_updated_at: None,
             swap_details: None,
             last_error: None,
             history: vec![],
@@ -645,97 +657,103 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
     verifier: V,
 ) -> Result<(), String> {
     let c = confirmation(body)?;
-    let now = host.now_ms();
-    let mut s = load(host, wallet, id)?;
-    if s.terminal() {
-        return Err("session is terminal".into());
-    }
-    validate_echo(&s.quote.quote_request, &s.quote, &s.wallet_address, now)?;
-    verifier(&s.quote)?;
-    match s.state.as_str() {
-        "quoted" => {
-            preflight(host, &s.origin, &s.wallet_address, &s.quote.quote.amount_in)?;
-            let tx = evm::prepare(
-                s.origin.contract_address.as_deref(),
-                s.quote.quote.deposit_address.as_deref().unwrap(),
-                &s.quote.quote.amount_in,
-            )?;
-            let digest = hex::encode(Sha256::digest(json(
-                &serde_json::json!({"app":"near-intents","session":s.id,"wallet":s.wallet,"wallet_address":s.wallet_address,"chain":s.origin.bloom_chain,"chain_id":s.origin.expected_chain_id,"asset":s.origin.asset_id,"contract":s.origin.contract_address,"deposit":s.quote.quote.deposit_address,"amount":s.quote.quote.amount_in,"transaction":tx,"correlation_id":s.quote.correlation_id,"quote_hash":s.quote_hash,"signature":s.quote.signature,"deadline":s.quote.quote.deadline,"destination":s.quote.quote_request.destination_asset,"recipient":s.quote.quote_request.recipient,"min_output":s.quote.quote.min_amount_out,"refund":s.quote.quote_request.refund_to}),
-            )?));
-            s.prepared_transaction = Some(tx);
-            s.prepared_digest = Some(digest);
-            s.transition(now, "prepared", "immutable deposit transaction prepared");
-            save(host, &s)
+    let lock_key = format!("locks/swaps/{wallet}/{id}");
+    let lock_token = acquire_lock(host, &lock_key, 120_000)?;
+    let result = (|| {
+        let now = host.now_ms();
+        let mut s = load(host, wallet, id)?;
+        if s.terminal() {
+            return Err("session is terminal".into());
         }
-        "prepared" => {
-            preflight(host, &s.origin, &s.wallet_address, &s.quote.quote.amount_in)?;
-            s.staging_started = true;
-            s.transition(
-                now,
-                "staging_started",
-                "durable ambiguity marker before outbox stage",
-            );
-            save(host, &s)?;
-            let tx = s
-                .prepared_transaction
-                .clone()
-                .ok_or("prepared transaction missing")?;
-            match host.tx_stage(&EvmTransaction {
-                wallet: s.wallet.clone(),
-                chain: s.origin.bloom_chain.clone(),
-                to: tx.to,
-                value_wei: tx.value_wei,
-                data_hex: tx.data_hex,
-                nonce: None,
-                max_fee_per_gas: None,
-                max_priority_fee_per_gas: None,
-            }) {
-                Ok(staged) => {
-                    s.outbox_id = Some(staged.outbox_id);
-                    s.plan_md = Some(staged.plan_md);
-                    s.approval=staged.approval.map(|a|serde_json::json!({"action_id":a.action_id,"ceremony_url":a.ceremony_url,"expires_ms":a.expires_ms}));
-                    s.staging_started = false;
-                    s.transition(now, "staged", "Bloom outbox transaction staged");
-                    save(host, &s)
-                }
-                Err(e) => {
-                    s.transition(
-                        now,
-                        "staging_ambiguous",
-                        "outbox stage returned without durable id",
-                    );
-                    s.last_error = Some(crate::redaction::sanitize_message(&e));
-                    save(host, &s)?;
-                    Err("outbox staging is ambiguous; manual recovery required".into())
+        validate_echo(&s.quote.quote_request, &s.quote, &s.wallet_address, now)?;
+        verifier(&s.quote)?;
+        match s.state.as_str() {
+            "quoted" => {
+                preflight(host, &s.origin, &s.wallet_address, &s.quote.quote.amount_in)?;
+                let tx = evm::prepare(
+                    s.origin.contract_address.as_deref(),
+                    s.quote.quote.deposit_address.as_deref().unwrap(),
+                    &s.quote.quote.amount_in,
+                )?;
+                let digest = hex::encode(Sha256::digest(json(
+                    &serde_json::json!({"app":"near-intents","session":s.id,"wallet":s.wallet,"wallet_address":s.wallet_address,"chain":s.origin.bloom_chain,"chain_id":s.origin.expected_chain_id,"asset":s.origin.asset_id,"contract":s.origin.contract_address,"deposit":s.quote.quote.deposit_address,"amount":s.quote.quote.amount_in,"transaction":tx,"correlation_id":s.quote.correlation_id,"quote_hash":s.quote_hash,"signature":s.quote.signature,"deadline":s.quote.quote.deadline,"destination":s.quote.quote_request.destination_asset,"recipient":s.quote.quote_request.recipient,"min_output":s.quote.quote.min_amount_out,"refund":s.quote.quote_request.refund_to}),
+                )?));
+                s.prepared_transaction = Some(tx);
+                s.prepared_digest = Some(digest);
+                s.transition(now, "prepared", "immutable deposit transaction prepared");
+                save(host, &s)
+            }
+            "prepared" => {
+                preflight(host, &s.origin, &s.wallet_address, &s.quote.quote.amount_in)?;
+                s.staging_started = true;
+                s.transition(
+                    now,
+                    "staging_started",
+                    "durable ambiguity marker before outbox stage",
+                );
+                save(host, &s)?;
+                let tx = s
+                    .prepared_transaction
+                    .clone()
+                    .ok_or("prepared transaction missing")?;
+                match host.tx_stage(&EvmTransaction {
+                    wallet: s.wallet.clone(),
+                    chain: s.origin.bloom_chain.clone(),
+                    to: tx.to,
+                    value_wei: tx.value_wei,
+                    data_hex: tx.data_hex,
+                    nonce: None,
+                    max_fee_per_gas: None,
+                    max_priority_fee_per_gas: None,
+                }) {
+                    Ok(staged) => {
+                        s.outbox_id = Some(staged.outbox_id);
+                        s.plan_md = Some(staged.plan_md);
+                        s.approval=staged.approval.map(|a|serde_json::json!({"action_id":a.action_id,"ceremony_url":a.ceremony_url,"expires_ms":a.expires_ms}));
+                        s.staging_started = false;
+                        s.transition(now, "staged", "Bloom outbox transaction staged");
+                        save(host, &s)
+                    }
+                    Err(e) => {
+                        s.transition(
+                            now,
+                            "staging_ambiguous",
+                            "outbox stage returned without durable id",
+                        );
+                        s.last_error = Some(crate::redaction::sanitize_message(&e));
+                        save(host, &s)?;
+                        Err("outbox staging is ambiguous; manual recovery required".into())
+                    }
                 }
             }
+            "staged" | "approval_required" => {
+                preflight(host, &s.origin, &s.wallet_address, &s.quote.quote.amount_in)?;
+                let id = s.outbox_id.clone().ok_or("outbox ID missing")?;
+                let out = host.tx_confirm(
+                    &s.wallet,
+                    &s.origin.bloom_chain,
+                    &id,
+                    c.acknowledge_warnings,
+                )?;
+                s.plan_md = Some(out.plan_md);
+                s.approval=out.approval.map(|a|serde_json::json!({"action_id":a.action_id,"ceremony_url":a.ceremony_url,"expires_ms":a.expires_ms}));
+                let next = if s.approval.is_some() {
+                    "approval_required"
+                } else {
+                    "deposit_broadcast_pending"
+                };
+                s.transition(now, next, "Bloom outbox confirmation advanced");
+                save(host, &s)
+            }
+            "deposit_broadcast_pending" | "deposit_sent" => inspect_outbox(host, &mut s),
+            "staging_started" | "staging_ambiguous" => {
+                Err("prior staging may have succeeded; refusing to restage".into())
+            }
+            _ => Err(format!("confirm cannot advance state {}", s.state)),
         }
-        "staged" | "approval_required" => {
-            preflight(host, &s.origin, &s.wallet_address, &s.quote.quote.amount_in)?;
-            let id = s.outbox_id.clone().ok_or("outbox ID missing")?;
-            let out = host.tx_confirm(
-                &s.wallet,
-                &s.origin.bloom_chain,
-                &id,
-                c.acknowledge_warnings,
-            )?;
-            s.plan_md = Some(out.plan_md);
-            s.approval=out.approval.map(|a|serde_json::json!({"action_id":a.action_id,"ceremony_url":a.ceremony_url,"expires_ms":a.expires_ms}));
-            let next = if s.approval.is_some() {
-                "approval_required"
-            } else {
-                "deposit_broadcast_pending"
-            };
-            s.transition(now, next, "Bloom outbox confirmation advanced");
-            save(host, &s)
-        }
-        "deposit_broadcast_pending" | "deposit_sent" => inspect_outbox(host, &mut s),
-        "staging_started" | "staging_ambiguous" => {
-            Err("prior staging may have succeeded; refusing to restage".into())
-        }
-        _ => Err(format!("confirm cannot advance state {}", s.state)),
-    }
+    })();
+    let release = host.delete_if(&lock_key, &lock_token);
+    finish_locked(result, release)
 }
 
 fn inspect_outbox<H: Host>(host: &mut H, s: &mut Session) -> Result<(), String> {
@@ -744,6 +762,9 @@ fn inspect_outbox<H: Host>(host: &mut H, s: &mut Session) -> Result<(), String> 
     s.outbox_state = Some(i.state.clone());
     if let Some(hash) = i.tx_hash {
         s.origin_tx_hash = Some(hash);
+    }
+    if let Some(receipt) = i.receipt_json.as_deref() {
+        s.outbox_receipt = render::sanitize_outbox_receipt(receipt);
     }
     let now = host.now_ms();
     if matches!(i.state.as_str(), "reverted" | "failed" | "cancelled") {
@@ -778,25 +799,26 @@ fn refresh_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
     {
         return Err("refresh requires refresh or {\"refresh\":true}".into());
     }
-    let mut s = load(host, wallet, id)?;
-    if s.terminal() {
-        return Ok(());
-    }
-    if s.outbox_id.is_some() && s.origin_tx_hash.is_none() {
-        inspect_outbox(host, &mut s)?;
-        s = load(host, wallet, id)?;
-        if s.origin_tx_hash.is_none() {
-            s.last_error = None;
-            save(host, &s)?;
+    let lock_key = format!("locks/swaps/{wallet}/{id}");
+    let lock_token = acquire_lock(host, &lock_key, 120_000)?;
+    let result = (|| {
+        let mut s = load(host, wallet, id)?;
+        if s.terminal() {
             return Ok(());
         }
-    }
-    let jwt = jwt(host)?;
-    if let Some(hash) = s.origin_tx_hash.clone()
-        && s.deposit_submit_state.as_deref() != Some("submitted")
-    {
-        let lock_key = format!("locks/submit/{wallet}/{id}");
-        if let Ok(lock_token) = acquire_lock(host, &lock_key, 60_000) {
+        if s.outbox_id.is_some() && s.origin_tx_hash.is_none() {
+            inspect_outbox(host, &mut s)?;
+            s = load(host, wallet, id)?;
+            if s.origin_tx_hash.is_none() {
+                s.last_error = None;
+                save(host, &s)?;
+                return Ok(());
+            }
+        }
+        let jwt = jwt(host)?;
+        if let Some(hash) = s.origin_tx_hash.clone()
+            && s.deposit_submit_state.as_deref() != Some("submitted")
+        {
             s.deposit_submit_state = Some("submit_ambiguous".into());
             save(host, &s)?;
             match api::submit(
@@ -809,91 +831,107 @@ fn refresh_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
                     host.put(&format!("swaps/{wallet}/{id}/submit.raw.json"), &raw, false)?;
                     s.deposit_submit_state = Some("submitted".into());
                     save(host, &s)?;
-                    let _ = host.delete_if(&lock_key, &lock_token);
                 }
                 Err(e) => {
                     s.last_error = Some(crate::redaction::sanitize_message(&e));
                     save(host, &s)?;
-                    let _ = host.delete_if(&lock_key, &lock_token);
                     return Err("deposit submit outcome is ambiguous; refresh may retry".into());
                 }
             }
         }
-    }
-    let (status, raw) = match api::status(
-        host,
-        &jwt,
-        s.quote.quote.deposit_address.as_deref().unwrap(),
-    ) {
-        Ok(value) => value,
-        Err(e) => {
-            s.last_error = Some(crate::redaction::sanitize_message(&e));
+        let (status, raw) = match api::status(
+            host,
+            &jwt,
+            s.quote.quote.deposit_address.as_deref().unwrap(),
+        ) {
+            Ok(value) => value,
+            Err(e) => {
+                s.last_error = Some(crate::redaction::sanitize_message(&e));
+                save(host, &s)?;
+                return Err(e);
+            }
+        };
+        host.put(&format!("swaps/{wallet}/{id}/status.raw.json"), &raw, false)?;
+        if status.correlation_id.len() > 256
+            || status.status.is_empty()
+            || status.status.len() > 64
+            || status.updated_at.len() > 64
+        {
+            s.last_error = Some("status metadata exceeds public safety bounds".into());
             save(host, &s)?;
-            return Err(e);
+            return Err("status metadata exceeds public safety bounds".into());
         }
-    };
-    host.put(&format!("swaps/{wallet}/{id}/status.raw.json"), &raw, false)?;
-    let mut status_quote = match status
-        .quote_response
-        .into_verified_shape(&s.quote.correlation_id)
-    {
-        Ok(quote) => quote,
-        Err(e) => {
-            s.last_error = Some(e.clone());
+        let mut status_quote = match status
+            .quote_response
+            .into_verified_shape(&s.quote.correlation_id)
+        {
+            Ok(quote) => quote,
+            Err(e) => {
+                s.last_error = Some(e.clone());
+                save(host, &s)?;
+                return Err(e);
+            }
+        };
+        if status_quote.quote_request.quote_waiting_time_ms.is_none() {
+            status_quote.quote_request.quote_waiting_time_ms =
+                s.quote.quote_request.quote_waiting_time_ms;
+        }
+        let hash = match verifier(&status_quote) {
+            Ok(hash) => hash,
+            Err(e) => {
+                s.last_error = Some(crate::redaction::sanitize_message(&e));
+                save(host, &s)?;
+                return Err(format!("status quote: {e}"));
+            }
+        };
+        if hash != s.quote_hash
+            || status_quote.quote.deposit_address != s.quote.quote.deposit_address
+            || status_quote.quote_request.recipient != s.quote.quote_request.recipient
+            || status_quote.quote_request.refund_to != s.quote.quote_request.refund_to
+        {
+            s.last_error = Some("status response does not correlate to persisted quote".into());
             save(host, &s)?;
-            return Err(e);
+            return Err("status response does not correlate to persisted quote".into());
         }
-    };
-    if status_quote.quote_request.quote_waiting_time_ms.is_none() {
-        status_quote.quote_request.quote_waiting_time_ms =
-            s.quote.quote_request.quote_waiting_time_ms;
-    }
-    let hash = match verifier(&status_quote) {
-        Ok(hash) => hash,
-        Err(e) => {
-            s.last_error = Some(crate::redaction::sanitize_message(&e));
-            save(host, &s)?;
-            return Err(format!("status quote: {e}"));
-        }
-    };
-    if hash != s.quote_hash
-        || status_quote.quote.deposit_address != s.quote.quote.deposit_address
-        || status_quote.quote_request.recipient != s.quote.quote_request.recipient
-        || status_quote.quote_request.refund_to != s.quote.quote_request.refund_to
-    {
-        s.last_error = Some("status response does not correlate to persisted quote".into());
-        save(host, &s)?;
-        return Err("status response does not correlate to persisted quote".into());
-    }
-    s.upstream_status = Some(status.status.clone());
-    s.swap_details = Some(status.swap_details);
-    s.last_error = None;
-    let next = match status.status.as_str() {
-        "SUCCESS" => "settled_success",
-        "REFUNDED" => "settled_refunded",
-        "FAILED" => "settled_failed",
-        "INCOMPLETE_DEPOSIT" => "deposit_incomplete",
-        "KNOWN_DEPOSIT_TX" => "known_deposit",
-        "PROCESSING" => "processing",
-        "PENDING_DEPOSIT" => "pending_deposit",
-        _ => "upstream_unknown",
-    };
-    s.transition(host.now_ms(), next, "verified 1Click status response");
-    save(host, &s)
+        s.upstream_status = Some(status.status.clone());
+        s.upstream_updated_at = Some(status.updated_at);
+        s.swap_details = Some(render::sanitize_swap_details(&status.swap_details));
+        s.last_error = None;
+        let next = match status.status.as_str() {
+            "SUCCESS" => "settled_success",
+            "REFUNDED" => "settled_refunded",
+            "FAILED" => "settled_failed",
+            "INCOMPLETE_DEPOSIT" => "deposit_incomplete",
+            "KNOWN_DEPOSIT_TX" => "known_deposit",
+            "PROCESSING" => "processing",
+            "PENDING_DEPOSIT" => "pending_deposit",
+            _ => "upstream_unknown",
+        };
+        s.transition(host.now_ms(), next, "verified 1Click status response");
+        save(host, &s)
+    })();
+    let release = host.delete_if(&lock_key, &lock_token);
+    finish_locked(result, release)
 }
 
 pub fn abandon<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<(), String> {
-    let mut s = load(host, wallet, id)?;
-    if s.outbox_id.is_some()
-        || matches!(
-            s.state.as_str(),
-            "deposit_broadcast_pending" | "deposit_sent"
-        )
-    {
-        return Err("cannot abandon after an outbox transaction exists".into());
-    }
-    s.transition(host.now_ms(), "abandoned", "user abandoned before deposit");
-    save(host, &s)
+    let lock_key = format!("locks/swaps/{wallet}/{id}");
+    let lock_token = acquire_lock(host, &lock_key, 120_000)?;
+    let result = (|| {
+        let mut s = load(host, wallet, id)?;
+        if s.outbox_id.is_some()
+            || matches!(
+                s.state.as_str(),
+                "deposit_broadcast_pending" | "deposit_sent"
+            )
+        {
+            return Err("cannot abandon after an outbox transaction exists".into());
+        }
+        s.transition(host.now_ms(), "abandoned", "user abandoned before deposit");
+        save(host, &s)
+    })();
+    let release = host.delete_if(&lock_key, &lock_token);
+    finish_locked(result, release)
 }
 
 #[cfg(test)]
@@ -910,6 +948,7 @@ mod workflow_tests {
     struct Shared {
         store: BTreeMap<String, Vec<u8>>,
         last_quote: Option<QuoteResponse>,
+        quote_request_json: Option<serde_json::Value>,
         stage_calls: usize,
         confirm_calls: usize,
         submit_calls: usize,
@@ -1002,7 +1041,10 @@ mod workflow_tests {
                             .iter()
                             .any(|(k, v)| k == "authorization" && v == &format!("Bearer {JWT}"))
                     );
-                    let request: QuoteRequest = serde_json::from_slice(&req.body).unwrap();
+                    let request_json: serde_json::Value =
+                        serde_json::from_slice(&req.body).unwrap();
+                    self.0.borrow_mut().quote_request_json = Some(request_json.clone());
+                    let request: QuoteRequest = serde_json::from_value(request_json).unwrap();
                     let mut quote = signed_quote(request);
                     quote.quote_request.insured = self.0.borrow().response_insured;
                     if self.0.borrow().corrupt_signature {
@@ -1036,7 +1078,7 @@ mod workflow_tests {
                     status_request.remove("quoteWaitingTimeMs");
                     status_request.remove("insured");
                     status_request.insert("appFees".into(), serde_json::json!([]));
-                    serde_json::to_vec(&serde_json::json!({"correlationId":q.correlation_id,"quoteResponse":status_quote,"status":"SUCCESS","updatedAt":"2027-01-15T08:01:00Z","swapDetails":{"intentHashes":["intent"],"nearTxHashes":["near"],"originChainTxHashes":[],"destinationChainTxHashes":[]}})).unwrap()
+                    serde_json::to_vec(&serde_json::json!({"correlationId":"independent-status-response-id","quoteResponse":status_quote,"status":"SUCCESS","updatedAt":"2027-01-15T08:01:00Z","swapDetails":{"intentHashes":["intent"],"nearTxHashes":["near"],"originChainTxHashes":[],"destinationChainTxHashes":[],"unknownSecret":"must-not-persist"}})).unwrap()
                 }
                 _ => return Err(format!("unexpected HTTP {} {}", req.method, path)),
             };
@@ -1191,10 +1233,42 @@ mod workflow_tests {
         let session = load(&mut restarted, "alice", &id).unwrap();
         assert_eq!(session.state, "settled_success");
         assert_eq!(session.origin_tx_hash.as_deref(), Some("0xabc"));
+        assert_eq!(session.outbox_receipt, Some(serde_json::json!({})));
+        assert!(
+            !session
+                .swap_details
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("unknownSecret")
+        );
         let shared = shared.borrow();
         assert_eq!(shared.stage_calls, 1);
         assert_eq!(shared.confirm_calls, 1);
         assert_eq!(shared.submit_calls, 1);
+        let request = shared
+            .quote_request_json
+            .as_ref()
+            .unwrap()
+            .as_object()
+            .unwrap();
+        for prohibited in [
+            "insured",
+            "confidentiality",
+            "connectedWallets",
+            "sessionId",
+            "virtualChainRecipient",
+            "virtualChainRefundRecipient",
+            "customRecipientMsg",
+            "referral",
+            "rebates",
+            "appFees",
+        ] {
+            assert!(
+                !request.contains_key(prohibited),
+                "sent prohibited field {prohibited}"
+            );
+        }
         let public = serde_json::to_string(&render::public_status(&session)).unwrap();
         assert!(!public.contains(JWT));
         assert!(!public.to_ascii_lowercase().contains("authorization"));
@@ -1222,6 +1296,37 @@ mod workflow_tests {
                 assert!(error.contains("unsupported execution metadata"));
             }
         }
+    }
+
+    #[test]
+    fn confirm_and_refresh_require_the_whole_session_lock() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "session_id":"test-session-lock",
+            "swap_type":"EXACT_INPUT",
+            "origin_asset":"nep141:eth.omft.near",
+            "destination_asset":"dest",
+            "amount":"1000",
+            "recipient":"recipient",
+            "deadline_seconds":900
+        }))
+        .unwrap();
+        let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
+        confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        let lock_key = format!("locks/swaps/alice/{id}");
+        shared.borrow_mut().store.insert(
+            lock_key,
+            br#"{"owner":"concurrent-route","expires_ms":1800000120000}"#.to_vec(),
+        );
+
+        assert!(confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).is_err());
+        assert!(refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).is_err());
+        assert_eq!(load(&mut host, "alice", &id).unwrap().state, "prepared");
+        let shared = shared.borrow();
+        assert_eq!(shared.stage_calls, 0);
+        assert_eq!(shared.status_calls, 0);
     }
 
     #[test]
