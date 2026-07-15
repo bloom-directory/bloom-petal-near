@@ -2,7 +2,7 @@ package bloom:route@0.1.0;
 
 interface types {
   record ctx {
-    app-root: string,
+    petal-root: string,
     package-hash: string,
     path: string,
     params: list<tuple<string, string>>,

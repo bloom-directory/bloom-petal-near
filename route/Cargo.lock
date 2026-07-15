@@ -740,7 +740,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-near-intents-v2-route"
+name = "bloom-near-intents-route"
 version = "0.1.0"
 dependencies = [
  "alloy",

@@ -10,17 +10,17 @@ trap 'rm -rf "$HOME_DIR"' EXIT
 "$BLOOM_BIN" -q --home "$HOME_DIR" init >/dev/null
 "$BLOOM_BIN" -q --home "$HOME_DIR" petals install "$ROOT" >/dev/null
 
-root_listing="$("$BLOOM_BIN" -q --home "$HOME_DIR" vfs ls /apps/near-intents)"
+root_listing="$("$BLOOM_BIN" -q --home "$HOME_DIR" vfs ls /petals/near-intents)"
 grep -q $'settings\tDir' <<<"$root_listing"
 grep -q $'swaps\tDir' <<<"$root_listing"
 
-before="$("$BLOOM_BIN" -q --home "$HOME_DIR" vfs cat /apps/near-intents/settings/api-key)"
+before="$("$BLOOM_BIN" -q --home "$HOME_DIR" vfs cat /petals/near-intents/settings/api-key)"
 grep -q '"configured": false' <<<"$before"
-"$BLOOM_BIN" -q --home "$HOME_DIR" vfs write /apps/near-intents/settings/api-key --data "$TOKEN" >/dev/null
+"$BLOOM_BIN" -q --home "$HOME_DIR" vfs write /petals/near-intents/settings/api-key --data "$TOKEN" >/dev/null
 
 # A new CLI process proves the private store survives daemon/process lifetime.
-after="$("$BLOOM_BIN" -q --home "$HOME_DIR" vfs cat /apps/near-intents/settings/api-key)"
-status="$("$BLOOM_BIN" -q --home "$HOME_DIR" vfs cat /apps/near-intents/settings/status.json)"
+after="$("$BLOOM_BIN" -q --home "$HOME_DIR" vfs cat /petals/near-intents/settings/api-key)"
+status="$("$BLOOM_BIN" -q --home "$HOME_DIR" vfs cat /petals/near-intents/settings/status.json)"
 grep -q '"configured": true' <<<"$after"
 grep -q '"configured": true' <<<"$status"
 if grep -q "$TOKEN" <<<"$after$status"; then

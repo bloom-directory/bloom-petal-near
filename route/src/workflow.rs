@@ -691,7 +691,7 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
                     &s.quote.quote.amount_in,
                 )?;
                 let digest = hex::encode(Sha256::digest(json(
-                    &serde_json::json!({"app":"near-intents","session":s.id,"wallet":s.wallet,"wallet_address":s.wallet_address,"chain":s.origin.bloom_chain,"chain_id":s.origin.expected_chain_id,"asset":s.origin.asset_id,"contract":s.origin.contract_address,"deposit":s.quote.quote.deposit_address,"amount":s.quote.quote.amount_in,"transaction":tx,"correlation_id":s.quote.correlation_id,"quote_hash":s.quote_hash,"signature":s.quote.signature,"deadline":s.quote.quote.deadline,"destination":s.quote.quote_request.destination_asset,"recipient":s.quote.quote_request.recipient,"min_output":s.quote.quote.min_amount_out,"refund":s.quote.quote_request.refund_to}),
+                    &serde_json::json!({"petal":"near-intents","session":s.id,"wallet":s.wallet,"wallet_address":s.wallet_address,"chain":s.origin.bloom_chain,"chain_id":s.origin.expected_chain_id,"asset":s.origin.asset_id,"contract":s.origin.contract_address,"deposit":s.quote.quote.deposit_address,"amount":s.quote.quote.amount_in,"transaction":tx,"correlation_id":s.quote.correlation_id,"quote_hash":s.quote_hash,"signature":s.quote.signature,"deadline":s.quote.quote.deadline,"destination":s.quote.quote_request.destination_asset,"recipient":s.quote.quote_request.recipient,"min_output":s.quote.quote.min_amount_out,"refund":s.quote.quote_request.refund_to}),
                 )?));
                 s.prepared_transaction = Some(tx);
                 s.prepared_digest = Some(digest);
