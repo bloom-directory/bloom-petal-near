@@ -4,14 +4,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BLOOM_REPO="${BLOOM_REPO:-}"
 
-cargo test --manifest-path "$ROOT/sdk/Cargo.toml"
 cargo test --manifest-path "$ROOT/route/Cargo.toml"
-cargo test --manifest-path "$ROOT/xtask/Cargo.toml"
 "$ROOT/scripts/build.sh"
-cargo run --manifest-path "$ROOT/xtask/Cargo.toml" --release -- check-caps
 
-if rg -q 'bloom:sign|allowed_intents' \
-  "$ROOT/petal.toml" "$ROOT/sdk/wit/route.wit" "$ROOT/sdk/src/lib.rs"; then
+if [[ -n "${PETAL_BIN:-}" ]]; then
+  "$PETAL_BIN" check --root "$ROOT"
+elif command -v petal >/dev/null 2>&1; then
+  petal check --root "$ROOT"
+else
+  "$ROOT/target/petal-tool/bin/petal" check --root "$ROOT"
+fi
+
+if rg -q 'bloom:sign|allowed_intents' "$ROOT/petal.toml" "$ROOT/route"; then
   echo "NEAR Intents package unexpectedly contains the Bloom signing surface" >&2
   exit 1
 fi
