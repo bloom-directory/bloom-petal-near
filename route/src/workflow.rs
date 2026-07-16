@@ -438,7 +438,7 @@ fn eth_call<H: Host>(
 }
 fn address_word(address: &str) -> Result<String, String> {
     assets::validate_address(address)?;
-    Ok(format!("{:0>64}", &address[2..].to_ascii_lowercase()))
+    Ok(format!("{:0>64}", address[2..].to_ascii_lowercase()))
 }
 
 fn preflight<H: Host>(
