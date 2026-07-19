@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BLOOM_REPO="${BLOOM_REPO:-}"
 
+"$ROOT/scripts/check-route-architecture.sh"
 cargo test --manifest-path "$ROOT/route/Cargo.toml"
 "$ROOT/scripts/build.sh"
 

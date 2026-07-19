@@ -18,6 +18,7 @@ jobs:
           workspaces: route
       - name: Test route crate
         run: |
+          scripts/check-route-architecture.sh
           cargo fmt --manifest-path route/Cargo.toml -- --check
           cargo test --manifest-path route/Cargo.toml --locked
           cargo clippy --manifest-path route/Cargo.toml --locked --all-targets -- -D warnings
