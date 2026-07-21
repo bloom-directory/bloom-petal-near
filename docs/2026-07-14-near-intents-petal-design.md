@@ -3,11 +3,11 @@
 **Status:** implementation specification
 **Date:** 2026-07-14
 **Target:** `bloom-petal-near`
-**Bloom compatibility:** local Petal app v2, `bloom:route@0.1.0`
+**Bloom compatibility:** Petal package v1, `bloom:route@0.1.0`
 
 ## 1. Decision
 
-Build a local Bloom Petal app mounted at `/apps/near-intents` that executes
+Build a Bloom Petal package mounted at `/petals/near-intents` that executes
 NEAR Intents swaps through the 1Click Swap API.
 
 Version 1 supports:
@@ -25,7 +25,7 @@ Version 1 supports:
 - persisted deposit submission, status, refund, and receipt information.
 
 The Petal must not delegate to a native NEAR Intents handler in Bloom. No such
-handler is required. The implementation uses only generic v2 Petal host
+handler is required. The implementation uses only generic Petal host
 interfaces.
 
 ## 2. Motivation
@@ -72,7 +72,7 @@ transaction enforcement.
 - User authentication/session endpoints, account balances, or account history.
 - Automated background jobs. Status advances when the user or agent writes to
   a refresh route.
-- A top-level `/near-intents` mount. Local Petal apps live under `/apps`.
+- A top-level `/near-intents` mount. Petals live under `/petals`.
 - Encrypted secret storage. Bloom's current secret namespace is private and
   mode-restricted but not an encrypted credential vault.
 
@@ -192,7 +192,7 @@ only as bounded evidence.
 
 ## 5. Package layout
 
-Use the current Polymarket v2 Petal as the structural reference, while keeping
+Use the current Polymarket Petal as the structural reference, while keeping
 all NEAR Intents behavior local to this repository:
 
 ```text
@@ -202,35 +202,29 @@ bloom-petal-near/
 ├── petal.toml
 ├── docs/
 │   └── 2026-07-14-near-intents-petal-design.md
-├── petal/
-│   ├── Cargo.toml
-│   ├── src/lib.rs
-│   └── wit/route.wit
+├── petal-build.toml
 ├── route/
 │   ├── Cargo.toml
 │   ├── files/
 │   └── src/
-├── xtask/
-│   ├── Cargo.toml
-│   └── src/main.rs
 ├── scripts/
 │   ├── build.sh
 │   └── validate.sh
-└── app/near-intents/          # generated; not committed
+└── petal/near-intents/        # generated; not committed
 ```
 
-`petal/` is a generic local framework crate. It may initially be derived from
-the Polymarket v2 Petal framework at the Bloom revision used for development,
-but it must not contain NEAR Intents semantics. Protocol DTOs, quote
-verification, state transitions, asset resolution, and transaction preparation
-belong in focused modules under `route/src/`.
+The route crate and builder configuration pin the canonical SDK and builder
+from `bloom-directory/petal`. This repository must not carry a private WIT,
+SDK, or builder copy. Protocol DTOs, quote verification, state transitions,
+asset resolution, and transaction preparation belong in focused modules under
+`route/src/`.
 
 The derived framework must not copy the Polymarket signing surface unchanged.
-Remove `import bloom:sign/signing@0.2.0` from `petal/wit/route.wit`, remove the
-signing SDK wrappers and types, and confirm no generated route component imports
-either version of `bloom:sign/signing`. Bloom install validation rejects a sign
-import when `bloom:sign` and `[sign].allowed_intents` are absent; this Petal
-deliberately declares neither.
+Remove the signing import, SDK wrappers, and types, and confirm no generated
+route component imports the sole structured signing interface,
+`bloom:sign/signing@0.1.0`. Bloom install validation rejects a sign import when
+`bloom:sign` and `[sign].allowed_intents` are absent; this Petal deliberately
+declares neither.
 
 Each route file builds as a `bloom:route@0.1.0` WASM component. Generated WASM,
 `target/`, and package artifacts are ignored.
@@ -240,7 +234,7 @@ Each route file builds as a `bloom:route@0.1.0` WASM component. Generated WASM,
 The initial `petal.toml` must be equivalent to:
 
 ```toml
-schema = "bloom.petal.local-app.v2"
+schema = "bloom.petal.package.v1"
 name = "near-intents"
 
 [source]
@@ -249,7 +243,7 @@ repository = "bloom-directory/bloom-petal-near"
 
 [build]
 command = "scripts/build.sh"
-outputs = ["app/near-intents"]
+outputs = ["petal/near-intents"]
 
 [consent]
 summary = "Request verified NEAR Intents 1Click quotes, stage EVM deposits through Bloom, and track cross-chain swap settlement."
@@ -297,7 +291,7 @@ explicitly reviewed design adds a separate trust-root configuration.
 Expose:
 
 ```text
-/apps/near-intents/settings/api-key
+/petals/near-intents/settings/api-key
 ```
 
 Writes accept either a raw non-whitespace JWT or:
@@ -351,7 +345,7 @@ upgrade; implicit secret migration is forbidden.
 ## 8. VFS contract
 
 ```text
-/apps/near-intents/
+/petals/near-intents/
 ├── meta/
 │   └── route-contract.json
 ├── tokens.json
@@ -598,7 +592,7 @@ locally with independently tested vectors.
 
 The prepared transaction record includes a canonical digest over:
 
-- package/app identity;
+- package/Petal identity;
 - session ID and wallet;
 - Bloom chain and expected chain ID;
 - origin asset and token contract/native marker;
@@ -944,7 +938,7 @@ route dispatcher.
 
 - Every declared route exports the complete route-file world.
 - Imported host interfaces exactly match Bloom-owned WIT.
-- No route component imports `bloom:sign/signing@0.1.0` or `@0.2.0`.
+- No route component imports `bloom:sign/signing@0.1.0`.
 - Manifest imports are covered by the capability ceiling.
 - Undeclared hosts, methods, paths, and redirects are denied.
 - Public VFS sweep proves no JWT, bearer header, raw secret-store path, or
@@ -990,7 +984,7 @@ scripts/validate.sh
 
 ## 23. Implementation sequence
 
-1. Scaffold the package, local framework, WIT, xtask, build scripts, manifest,
+1. Scaffold the package, canonical SDK/builder pins, build scripts, manifest,
    static routes, and package-validation smoke test.
 2. Implement settings, persistent JWT storage, redacted status, and network
    policy tests.
@@ -1010,7 +1004,7 @@ scripts/validate.sh
 
 The Petal is implementation-complete when:
 
-- it installs as a valid v2 package and mounts at `/apps/near-intents`;
+- it installs as a valid package and mounts at `/petals/near-intents`;
 - a JWT written once remains usable after daemon restart without being readable
   through the VFS;
 - an EVM-origin exact-input or exact-output request produces a valid signed
@@ -1042,9 +1036,9 @@ The Petal is implementation-complete when:
   `https://docs.near-intents.org/resources/asset-support`
 - Supported chains:
   `https://docs.near-intents.org/resources/chain-support`
-- Bloom local Petal apps:
-  `../../bloom/docs/guides/local-petal-apps-v2.md`
+- Bloom Petal authoring:
+  `../../bloom/docs/petals/authoring-petals.md`
 - Bloom Machine and Petal trust boundary:
   `../../bloom/docs/architecture/Bloom Machine + Petals.md`
-- Polymarket v2 Petal reference:
+- Polymarket Petal reference:
   `../../bloom-petal-polymarket/`

@@ -1,3 +1,4 @@
+pub use crate::runtime::{BloomHost, Host};
 use crate::{
     api,
     api_types::{QuoteRequest, QuoteResponse},
@@ -7,97 +8,8 @@ use crate::{
     session::{self, Session},
     settings::{self, PartnerJwt},
 };
-use petal::sdk::{EvmTransaction, HttpRequest, HttpResponse, OutboxInspection, StagedTransaction};
+use petal::sdk::EvmTransaction;
 use sha2::{Digest, Sha256};
-
-pub trait Host {
-    fn now_ms(&mut self) -> u64;
-    fn random(&mut self, len: usize) -> Result<Vec<u8>, String>;
-    fn setting(&mut self, key: &str) -> Result<Option<String>, String>;
-    fn http(&mut self, req: HttpRequest, max: usize) -> Result<HttpResponse, String>;
-    fn get(&mut self, key: &str, max: usize) -> Result<Option<Vec<u8>>, String>;
-    fn list(&mut self, prefix: &str, max: usize) -> Result<Vec<String>, String>;
-    fn put(&mut self, key: &str, value: &[u8], secret: bool) -> Result<(), String>;
-    fn put_new(&mut self, key: &str, value: &[u8], secret: bool) -> Result<(), String>;
-    fn delete_if(&mut self, key: &str, expected: &[u8]) -> Result<(), String>;
-    fn vfs_read(&mut self, path: &str, max: usize) -> Result<Vec<u8>, String>;
-    fn chain_read(&mut self, chain: &str, method: &str, params: &str) -> Result<String, String>;
-    fn tx_stage(&mut self, tx: &EvmTransaction) -> Result<StagedTransaction, String>;
-    fn tx_confirm(
-        &mut self,
-        wallet: &str,
-        chain: &str,
-        id: &str,
-        warnings: bool,
-    ) -> Result<StagedTransaction, String>;
-    fn tx_inspect(
-        &mut self,
-        wallet: &str,
-        chain: &str,
-        id: &str,
-    ) -> Result<OutboxInspection, String>;
-}
-
-pub struct BloomHost;
-impl Host for BloomHost {
-    fn now_ms(&mut self) -> u64 {
-        petal::sdk::now_ms()
-    }
-    fn random(&mut self, len: usize) -> Result<Vec<u8>, String> {
-        petal::sdk::random_bytes(len).map_err(|e| e.message())
-    }
-    fn setting(&mut self, key: &str) -> Result<Option<String>, String> {
-        petal::sdk::runtime_setting(key).map_err(|e| e.message())
-    }
-    fn http(&mut self, req: HttpRequest, max: usize) -> Result<HttpResponse, String> {
-        petal::sdk::http_fetch(&req, max).map_err(|e| e.message())
-    }
-    fn get(&mut self, key: &str, max: usize) -> Result<Option<Vec<u8>>, String> {
-        match petal::sdk::store_get(key, max) {
-            Ok(v) => Ok(Some(v)),
-            Err(petal::SdkError::Host(petal::HostStatus::NotFound)) => Ok(None),
-            Err(e) => Err(e.message()),
-        }
-    }
-    fn list(&mut self, prefix: &str, max: usize) -> Result<Vec<String>, String> {
-        petal::sdk::store_list(prefix, max).map_err(|e| e.message())
-    }
-    fn put(&mut self, key: &str, value: &[u8], secret: bool) -> Result<(), String> {
-        petal::sdk::store_put(key, value, secret).map_err(|e| e.message())
-    }
-    fn put_new(&mut self, key: &str, value: &[u8], secret: bool) -> Result<(), String> {
-        petal::sdk::store_put_new(key, value, secret).map_err(|e| e.message())
-    }
-    fn delete_if(&mut self, key: &str, expected: &[u8]) -> Result<(), String> {
-        petal::sdk::store_del_if_value(key, expected).map_err(|e| e.message())
-    }
-    fn vfs_read(&mut self, path: &str, max: usize) -> Result<Vec<u8>, String> {
-        petal::sdk::vfs_read(path, max).map_err(|e| e.message())
-    }
-    fn chain_read(&mut self, chain: &str, method: &str, params: &str) -> Result<String, String> {
-        petal::sdk::chain_read(chain, method, params).map_err(|e| e.message())
-    }
-    fn tx_stage(&mut self, tx: &EvmTransaction) -> Result<StagedTransaction, String> {
-        petal::sdk::tx_stage(tx).map_err(|e| e.message())
-    }
-    fn tx_confirm(
-        &mut self,
-        wallet: &str,
-        chain: &str,
-        id: &str,
-        warnings: bool,
-    ) -> Result<StagedTransaction, String> {
-        petal::sdk::tx_confirm(wallet, chain, id, warnings).map_err(|e| e.message())
-    }
-    fn tx_inspect(
-        &mut self,
-        wallet: &str,
-        chain: &str,
-        id: &str,
-    ) -> Result<OutboxInspection, String> {
-        petal::sdk::tx_inspect(wallet, chain, id).map_err(|e| e.message())
-    }
-}
 
 fn json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
     serde_json::to_vec(value).map_err(|e| e.to_string())
@@ -106,145 +18,6 @@ fn save<H: Host>(host: &mut H, s: &Session) -> Result<(), String> {
     host.put(&s.key(), &json(s)?, false)
 }
 
-fn dispatch(result: Result<(), String>) -> petal::DispatchResponse {
-    match result {
-        Ok(()) => petal::DispatchResponse::Write,
-        Err(e) => petal::error(-4, crate::redaction::sanitize_message(&e)),
-    }
-}
-
-pub fn write_api_key_route(body: &[u8]) -> petal::DispatchResponse {
-    let mut h = BloomHost;
-    dispatch(write_api_key(&mut h, body))
-}
-pub fn read_api_key_route() -> petal::DispatchResponse {
-    let mut h = BloomHost;
-    match credential_status(&mut h) {
-        Ok(v) => petal::read_json_value(&v),
-        Err(e) => petal::error(-4, e),
-    }
-}
-pub fn settings_status_route() -> petal::DispatchResponse {
-    let mut h = BloomHost;
-    match credential_status(&mut h) {
-        Ok(v) => petal::read_json_value(
-            &serde_json::json!({"credential":v,"endpoint_binding":"oneclick","supported_origins":assets::CHAINS.iter().map(|m|serde_json::json!({"oneclick":m.oneclick,"bloom":m.bloom,"chain_id":m.chain_id})).collect::<Vec<_>>() }),
-        ),
-        Err(e) => petal::error(-4, e),
-    }
-}
-pub fn tokens_route() -> petal::DispatchResponse {
-    let mut h = BloomHost;
-    match api::tokens(&mut h){Ok((v,_))=>petal::read_json_value(&v.iter().map(|t|serde_json::json!({"assetId":t.asset_id,"decimals":t.decimals,"blockchain":t.blockchain,"symbol":t.symbol,"price":t.price,"priceUpdatedAt":t.price_updated_at,"contractAddress":t.contract_address,"execution":if assets::chain_mapping(&t.blockchain).is_some(){"executable"}else{"quote_only"}})).collect::<Vec<_>>()),Err(e)=>petal::error(-4,e)}
-}
-pub fn create_route(wallet: &str, body: &[u8]) -> petal::DispatchResponse {
-    let mut h = BloomHost;
-    match create(&mut h, wallet, body) {
-        Ok(_) => petal::DispatchResponse::Write,
-        Err(e) => petal::error(-4, crate::redaction::sanitize_message(&e)),
-    }
-}
-pub fn confirm_route(wallet: &str, id: &str, body: &[u8]) -> petal::DispatchResponse {
-    let mut h = BloomHost;
-    dispatch(confirm(&mut h, wallet, id, body))
-}
-pub fn refresh_route(wallet: &str, id: &str, body: &[u8]) -> petal::DispatchResponse {
-    let mut h = BloomHost;
-    dispatch(refresh(&mut h, wallet, id, body))
-}
-pub fn abandon_route(wallet: &str, id: &str) -> petal::DispatchResponse {
-    let mut h = BloomHost;
-    dispatch(abandon(&mut h, wallet, id))
-}
-pub fn latest_route(wallet: &str) -> petal::DispatchResponse {
-    let mut h = BloomHost;
-    match h.get(&format!("swaps/{wallet}/latest"), 128) {
-        Ok(Some(v)) => petal::DispatchResponse::Read(v),
-        Ok(None) => petal::error(-1, "no swap session"),
-        Err(e) => petal::error(-4, e),
-    }
-}
-pub fn session_children(wallet: &str) -> Result<Vec<petal::RouteChild>, petal::DispatchResponse> {
-    let mut h = BloomHost;
-    let prefix = format!("swaps/{wallet}/");
-    let keys = h
-        .list(&prefix, 1024 * 1024)
-        .map_err(|e| petal::error(-4, e))?;
-    let mut ids = std::collections::BTreeSet::new();
-    for key in keys {
-        if let Some(rest) = key.strip_prefix(&prefix)
-            && let Some((id, file)) = rest.split_once('/')
-            && matches!(file, "session.json" | "failure.json")
-            && petal::is_safe_segment(id)
-        {
-            ids.insert(id.to_string());
-        }
-    }
-    let mut out = vec![petal::writable("new"), petal::file("latest")];
-    out.extend(ids.into_iter().map(petal::dir));
-    Ok(out)
-}
-pub fn session_route(wallet: &str, id: &str, field: &str) -> petal::DispatchResponse {
-    let mut h = BloomHost;
-    let s = match load(&mut h, wallet, id) {
-        Ok(s) => s,
-        Err(e) => {
-            if field == "status"
-                && let Ok(Some(raw)) = h.get(&session::failure_key(wallet, id), 64 * 1024)
-            {
-                return petal::DispatchResponse::Read(raw);
-            }
-            return petal::error(-1, e);
-        }
-    };
-    match field {
-        "request" => petal::read_json_value(&s.request),
-        "quote" => petal::read_json_value(
-            &serde_json::json!({"correlation_id":s.quote.correlation_id,"timestamp":s.quote.timestamp,"signature":s.quote.signature,"quote_request":s.quote.quote_request,"quote":s.quote.quote,"verified":s.quote_verified,"hash":s.quote_hash}),
-        ),
-        "review" => petal::read_json_value(
-            &serde_json::json!({"prepared_artifact_digest":s.prepared_digest,"wallet":s.wallet,"wallet_address":s.wallet_address,"origin":s.origin,"quote_hash":s.quote_hash,"transaction":s.prepared_transaction,"destination_asset":s.quote.quote_request.destination_asset,"recipient":s.quote.quote_request.recipient,"minimum_output":s.quote.quote.min_amount_out,"refund_to":s.quote.quote_request.refund_to}),
-        ),
-        "plan" => petal::DispatchResponse::Read(render::plan(&s).into_bytes()),
-        "policy" => petal::read_json_value(
-            &serde_json::json!({"quote_verified":s.quote_verified,"chain_id_expected":s.origin.expected_chain_id,"state":s.state,"outbox_state":s.outbox_state}),
-        ),
-        "approval" => s
-            .approval
-            .as_ref()
-            .map(petal::read_json_value)
-            .unwrap_or_else(|| petal::error(-1, "no approval pending")),
-        "outbox" => {
-            let receipt = s
-                .outbox_receipt
-                .as_ref()
-                .and_then(render::sanitize_outbox_receipt_value);
-            petal::read_json_value(
-                &serde_json::json!({"id":s.outbox_id,"chain":s.origin.bloom_chain,"state":s.outbox_state,"tx_hash":s.origin_tx_hash,"receipt":receipt}),
-            )
-        }
-        "status" => petal::read_json_value(&render::public_status(&s)),
-        "receipt" => {
-            if s.terminal() && s.state != "abandoned" {
-                let swap_details = s
-                    .swap_details
-                    .as_ref()
-                    .map(render::sanitize_swap_details)
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let outbox_receipt = s
-                    .outbox_receipt
-                    .as_ref()
-                    .and_then(render::sanitize_outbox_receipt_value);
-                petal::read_json_value(
-                    &serde_json::json!({"state":s.state,"origin_tx_hash":s.origin_tx_hash,"outbox_receipt":outbox_receipt,"upstream_status":s.upstream_status,"upstream_updated_at":s.upstream_updated_at,"swap_details":swap_details,"updated_ms":s.updated_ms}),
-                )
-            } else {
-                petal::error(-1, "terminal receipt not available")
-            }
-        }
-        _ => petal::error(-3, "unknown session view"),
-    }
-}
 pub fn load<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<Session, String> {
     let raw = host
         .get(&session::key(wallet, id), 2 * 1024 * 1024)?
@@ -253,7 +26,7 @@ pub fn load<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<Session, St
 }
 fn jwt<H: Host>(host: &mut H) -> Result<PartnerJwt, String> {
     let raw = host
-        .get(settings::JWT_KEY, 8192)?
+        .get_secret(settings::JWT_KEY, 8192)?
         .ok_or("1Click API key is not configured")?;
     settings::parse_jwt(&raw)
 }
@@ -295,7 +68,7 @@ pub fn write_api_key<H: Host>(host: &mut H, body: &[u8]) -> Result<(), String> {
 }
 pub fn credential_status<H: Host>(host: &mut H) -> Result<settings::CredentialStatus, String> {
     Ok(settings::status(
-        host.get(settings::JWT_KEY, 8192)?.is_some(),
+        host.get_secret(settings::JWT_KEY, 8192)?.is_some(),
     ))
 }
 
@@ -438,7 +211,7 @@ fn eth_call<H: Host>(
 }
 fn address_word(address: &str) -> Result<String, String> {
     assets::validate_address(address)?;
-    Ok(format!("{:0>64}", &address[2..].to_ascii_lowercase()))
+    Ok(format!("{:0>64}", address[2..].to_ascii_lowercase()))
 }
 
 fn preflight<H: Host>(
@@ -691,7 +464,7 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
                     &s.quote.quote.amount_in,
                 )?;
                 let digest = hex::encode(Sha256::digest(json(
-                    &serde_json::json!({"app":"near-intents","session":s.id,"wallet":s.wallet,"wallet_address":s.wallet_address,"chain":s.origin.bloom_chain,"chain_id":s.origin.expected_chain_id,"asset":s.origin.asset_id,"contract":s.origin.contract_address,"deposit":s.quote.quote.deposit_address,"amount":s.quote.quote.amount_in,"transaction":tx,"correlation_id":s.quote.correlation_id,"quote_hash":s.quote_hash,"signature":s.quote.signature,"deadline":s.quote.quote.deadline,"destination":s.quote.quote_request.destination_asset,"recipient":s.quote.quote_request.recipient,"min_output":s.quote.quote.min_amount_out,"refund":s.quote.quote_request.refund_to}),
+                    &serde_json::json!({"petal":"near-intents","session":s.id,"wallet":s.wallet,"wallet_address":s.wallet_address,"chain":s.origin.bloom_chain,"chain_id":s.origin.expected_chain_id,"asset":s.origin.asset_id,"contract":s.origin.contract_address,"deposit":s.quote.quote.deposit_address,"amount":s.quote.quote.amount_in,"transaction":tx,"correlation_id":s.quote.correlation_id,"quote_hash":s.quote_hash,"signature":s.quote.signature,"deadline":s.quote.quote.deadline,"destination":s.quote.quote_request.destination_asset,"recipient":s.quote.quote_request.recipient,"min_output":s.quote.quote.min_amount_out,"refund":s.quote.quote_request.refund_to}),
                 )?));
                 s.prepared_transaction = Some(tx);
                 s.prepared_digest = Some(digest);
@@ -953,6 +726,7 @@ pub fn abandon<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<(), Stri
 mod workflow_tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use petal::sdk::{HttpRequest, HttpResponse, OutboxInspection, StagedTransaction};
     use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
     const WALLET: &str = "0x1111111111111111111111111111111111111111";
@@ -1104,6 +878,9 @@ mod workflow_tests {
             })
         }
         fn get(&mut self, key: &str, _: usize) -> Result<Option<Vec<u8>>, String> {
+            Ok(self.0.borrow().store.get(key).cloned())
+        }
+        fn get_secret(&mut self, key: &str, _: usize) -> Result<Option<Vec<u8>>, String> {
             Ok(self.0.borrow().store.get(key).cloned())
         }
         fn list(&mut self, prefix: &str, _: usize) -> Result<Vec<String>, String> {
@@ -1284,7 +1061,20 @@ mod workflow_tests {
                 "sent prohibited field {prohibited}"
             );
         }
-        let public = serde_json::to_string(&render::public_status(&session)).unwrap();
+        let public = serde_json::json!({
+            "id": session.id,
+            "wallet": session.wallet,
+            "state": session.state,
+            "updated_ms": session.updated_ms,
+            "quote_verified": session.quote_verified,
+            "outbox_id": session.outbox_id,
+            "outbox_state": session.outbox_state,
+            "origin_tx_hash": session.origin_tx_hash,
+            "upstream_status": session.upstream_status,
+            "last_error": session.last_error,
+            "history": session.history,
+        })
+        .to_string();
         assert!(!public.contains(JWT));
         assert!(!public.to_ascii_lowercase().contains("authorization"));
     }

@@ -1,4 +1,4 @@
-schema = "bloom.petal.local-app.v2"
+schema = "bloom.petal.package.v1"
 name = "near-intents"
 
 [source]
@@ -7,7 +7,7 @@ repository = "bloom-directory/bloom-petal-near"
 
 [build]
 command = "scripts/build.sh"
-outputs = ["app/near-intents"]
+outputs = ["petal/near-intents"]
 
 [consent]
 summary = "Request verified NEAR Intents 1Click quotes, stage EVM deposits through Bloom, and track cross-chain swap settlement."
