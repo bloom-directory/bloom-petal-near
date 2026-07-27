@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 pub const JWT_KEY: &str = "credentials/partner-jwt";
+const EMBEDDED_PARTNER_JWT: Option<&str> = option_env!("NEAR_INTENTS_PARTNER_JWT");
 
 #[derive(Clone)]
 pub struct PartnerJwt(String);
@@ -15,9 +16,24 @@ impl PartnerJwt {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialSource {
+    PrivateStore,
+    EmbeddedPartner,
+    Unconfigured,
+}
+
+#[derive(Debug)]
+pub struct ResolvedPartnerJwt {
+    pub jwt: PartnerJwt,
+    pub source: CredentialSource,
+}
+
+#[derive(Debug, Serialize)]
 pub struct CredentialStatus {
     pub configured: bool,
+    pub source: CredentialSource,
     pub storage: &'static str,
     pub encrypted_at_rest: bool,
 }
@@ -48,17 +64,60 @@ pub fn parse_jwt(body: &[u8]) -> Result<PartnerJwt, String> {
     Ok(PartnerJwt(token.into()))
 }
 
-pub fn status(configured: bool) -> CredentialStatus {
-    CredentialStatus {
-        configured,
-        storage: "persistent_private_store",
-        encrypted_at_rest: false,
+pub fn resolve_partner_jwt(
+    private_store: Option<&[u8]>,
+    embedded: Option<&str>,
+) -> Result<ResolvedPartnerJwt, String> {
+    if let Some(raw) = private_store {
+        return Ok(ResolvedPartnerJwt {
+            jwt: parse_jwt(raw)?,
+            source: CredentialSource::PrivateStore,
+        });
     }
+    if let Some(raw) = embedded {
+        return Ok(ResolvedPartnerJwt {
+            jwt: parse_jwt(raw.as_bytes())?,
+            source: CredentialSource::EmbeddedPartner,
+        });
+    }
+    Err("1Click API key is not configured".into())
+}
+
+pub fn configured_partner_jwt(private_store: Option<&[u8]>) -> Result<ResolvedPartnerJwt, String> {
+    resolve_partner_jwt(private_store, EMBEDDED_PARTNER_JWT)
+}
+
+pub fn status(
+    private_store: Option<&[u8]>,
+    embedded: Option<&str>,
+) -> Result<CredentialStatus, String> {
+    let source = if private_store.is_none() && embedded.is_none() {
+        CredentialSource::Unconfigured
+    } else {
+        resolve_partner_jwt(private_store, embedded)?.source
+    };
+    let (configured, storage) = match source {
+        CredentialSource::PrivateStore => (true, "persistent_private_store"),
+        CredentialSource::EmbeddedPartner => (true, "release_artifact"),
+        CredentialSource::Unconfigured => (false, "none"),
+    };
+    Ok(CredentialStatus {
+        configured,
+        source,
+        storage,
+        encrypted_at_rest: false,
+    })
+}
+
+pub fn configured_status(private_store: Option<&[u8]>) -> Result<CredentialStatus, String> {
+    status(private_store, EMBEDDED_PARTNER_JWT)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    const TEST_TOKEN: &str = "test.jwt.must-never-appear";
+
     #[test]
     fn parses_without_echoing_on_error() {
         let secret = "top-secret token";
@@ -68,5 +127,62 @@ mod tests {
             format!("{:?}", PartnerJwt("x".into())),
             "PartnerJwt([redacted])"
         );
+    }
+
+    #[test]
+    fn embedded_fallback_succeeds() {
+        let resolved = resolve_partner_jwt(None, Some(TEST_TOKEN)).unwrap();
+        assert_eq!(resolved.source, CredentialSource::EmbeddedPartner);
+        assert_eq!(resolved.jwt.expose(), TEST_TOKEN);
+    }
+
+    #[test]
+    fn private_store_wins_over_embedded_fallback() {
+        let resolved =
+            resolve_partner_jwt(Some(b"private.jwt.override"), Some(TEST_TOKEN)).unwrap();
+        assert_eq!(resolved.source, CredentialSource::PrivateStore);
+        assert_eq!(resolved.jwt.expose(), "private.jwt.override");
+    }
+
+    #[test]
+    fn missing_credentials_fails() {
+        assert_eq!(
+            resolve_partner_jwt(None, None).unwrap_err(),
+            "1Click API key is not configured"
+        );
+    }
+
+    #[test]
+    fn malformed_embedded_value_fails_without_echoing_it() {
+        let malformed = "test.jwt.must-never-appear malformed";
+        let error = resolve_partner_jwt(None, Some(malformed)).unwrap_err();
+        assert!(!error.contains(malformed));
+        assert!(!format!("{:?}", resolve_partner_jwt(None, Some(malformed))).contains(malformed));
+    }
+
+    #[test]
+    fn debug_and_public_status_never_reveal_token() {
+        let resolved = resolve_partner_jwt(None, Some(TEST_TOKEN)).unwrap();
+        let embedded_status = status(None, Some(TEST_TOKEN)).unwrap();
+        let private_status = status(Some(TEST_TOKEN.as_bytes()), Some("fallback.jwt")).unwrap();
+        let unconfigured_status = status(None, None).unwrap();
+        let public_route_projection = serde_json::json!({
+            "credential": &embedded_status,
+            "endpoint_binding": "oneclick",
+        });
+        let output = format!(
+            "{resolved:?}\n{embedded_status:?}\n{}\n{}\n{public_route_projection}",
+            serde_json::to_string(&embedded_status).unwrap(),
+            serde_json::to_string(&private_status).unwrap()
+        );
+        assert!(!output.contains(TEST_TOKEN));
+        assert!(output.contains("embedded_partner"));
+        assert!(output.contains("release_artifact"));
+        assert_eq!(private_status.source, CredentialSource::PrivateStore);
+        assert_eq!(private_status.storage, "persistent_private_store");
+        assert!(private_status.configured);
+        assert_eq!(unconfigured_status.source, CredentialSource::Unconfigured);
+        assert_eq!(unconfigured_status.storage, "none");
+        assert!(!unconfigured_status.configured);
     }
 }
