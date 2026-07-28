@@ -4,6 +4,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PETAL_REV="4f6fb57063a70f95cba288f68bdc139e3ecac7a5"
 
+if [[ "${PETAL_COMPILE_TIME_SECRET+x}" == "x" ]]; then
+  if [[ -z "$PETAL_COMPILE_TIME_SECRET" ]]; then
+    echo "PETAL_COMPILE_TIME_SECRET is not configured" >&2
+    exit 1
+  fi
+  export NEAR_INTENTS_PARTNER_JWT="$PETAL_COMPILE_TIME_SECRET"
+  unset PETAL_COMPILE_TIME_SECRET
+fi
+
 if [[ -n "${PETAL_BIN:-}" ]]; then
   "$PETAL_BIN" build --root "$ROOT"
 elif command -v petal >/dev/null 2>&1; then
