@@ -16,6 +16,8 @@ grep -q $'swaps\tDir' <<<"$root_listing"
 
 before="$("$BLOOM_BIN" -q --home "$HOME_DIR" vfs cat /petals/near-intents/settings/api-key)"
 grep -q '"configured": false' <<<"$before"
+grep -q '"source": "unconfigured"' <<<"$before"
+grep -q '"storage": "none"' <<<"$before"
 "$BLOOM_BIN" -q --home "$HOME_DIR" vfs write /petals/near-intents/settings/api-key --data "$TOKEN" >/dev/null
 
 # A new CLI process proves the private store survives daemon/process lifetime.
@@ -23,6 +25,8 @@ after="$("$BLOOM_BIN" -q --home "$HOME_DIR" vfs cat /petals/near-intents/setting
 status="$("$BLOOM_BIN" -q --home "$HOME_DIR" vfs cat /petals/near-intents/settings/status.json)"
 grep -q '"configured": true' <<<"$after"
 grep -q '"configured": true' <<<"$status"
+grep -q '"source": "private_store"' <<<"$after$status"
+grep -q '"storage": "persistent_private_store"' <<<"$after$status"
 if grep -q "$TOKEN" <<<"$after$status"; then
   echo "credential was echoed by a public VFS route" >&2
   exit 1

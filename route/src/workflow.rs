@@ -25,10 +25,8 @@ pub fn load<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<Session, St
     serde_json::from_slice(&raw).map_err(|e| format!("corrupt session: {e}"))
 }
 fn jwt<H: Host>(host: &mut H) -> Result<PartnerJwt, String> {
-    let raw = host
-        .get_secret(settings::JWT_KEY, 8192)?
-        .ok_or("1Click API key is not configured")?;
-    settings::parse_jwt(&raw)
+    let private_store = host.get_secret(settings::JWT_KEY, 8192)?;
+    settings::configured_partner_jwt(private_store.as_deref()).map(|resolved| resolved.jwt)
 }
 
 fn acquire_lock<H: Host>(host: &mut H, key: &str, ttl_ms: u64) -> Result<Vec<u8>, String> {
@@ -67,9 +65,8 @@ pub fn write_api_key<H: Host>(host: &mut H, body: &[u8]) -> Result<(), String> {
     host.put(settings::JWT_KEY, jwt.expose().as_bytes(), true)
 }
 pub fn credential_status<H: Host>(host: &mut H) -> Result<settings::CredentialStatus, String> {
-    Ok(settings::status(
-        host.get_secret(settings::JWT_KEY, 8192)?.is_some(),
-    ))
+    let private_store = host.get_secret(settings::JWT_KEY, 8192)?;
+    Ok(settings::configured_status(private_store.as_deref()))
 }
 
 fn wallet_details<H: Host>(host: &mut H, wallet: &str) -> Result<(String, String), String> {
