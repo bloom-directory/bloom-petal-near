@@ -87,29 +87,31 @@ pub fn configured_partner_jwt(private_store: Option<&[u8]>) -> Result<ResolvedPa
     resolve_partner_jwt(private_store, EMBEDDED_PARTNER_JWT)
 }
 
-pub fn status(
-    private_store: Option<&[u8]>,
-    embedded: Option<&str>,
-) -> Result<CredentialStatus, String> {
-    let source = if private_store.is_none() && embedded.is_none() {
-        CredentialSource::Unconfigured
+pub fn status(private_store: Option<&[u8]>, embedded: Option<&str>) -> CredentialStatus {
+    let (configured, source, storage) = if let Some(raw) = private_store {
+        (
+            parse_jwt(raw).is_ok(),
+            CredentialSource::PrivateStore,
+            "persistent_private_store",
+        )
+    } else if let Some(raw) = embedded {
+        (
+            parse_jwt(raw.as_bytes()).is_ok(),
+            CredentialSource::EmbeddedPartner,
+            "release_artifact",
+        )
     } else {
-        resolve_partner_jwt(private_store, embedded)?.source
+        (false, CredentialSource::Unconfigured, "none")
     };
-    let (configured, storage) = match source {
-        CredentialSource::PrivateStore => (true, "persistent_private_store"),
-        CredentialSource::EmbeddedPartner => (true, "release_artifact"),
-        CredentialSource::Unconfigured => (false, "none"),
-    };
-    Ok(CredentialStatus {
+    CredentialStatus {
         configured,
         source,
         storage,
         encrypted_at_rest: false,
-    })
+    }
 }
 
-pub fn configured_status(private_store: Option<&[u8]>) -> Result<CredentialStatus, String> {
+pub fn configured_status(private_store: Option<&[u8]>) -> CredentialStatus {
     status(private_store, EMBEDDED_PARTNER_JWT)
 }
 
@@ -163,9 +165,9 @@ mod tests {
     #[test]
     fn debug_and_public_status_never_reveal_token() {
         let resolved = resolve_partner_jwt(None, Some(TEST_TOKEN)).unwrap();
-        let embedded_status = status(None, Some(TEST_TOKEN)).unwrap();
-        let private_status = status(Some(TEST_TOKEN.as_bytes()), Some("fallback.jwt")).unwrap();
-        let unconfigured_status = status(None, None).unwrap();
+        let embedded_status = status(None, Some(TEST_TOKEN));
+        let private_status = status(Some(TEST_TOKEN.as_bytes()), Some("fallback.jwt"));
+        let unconfigured_status = status(None, None);
         let public_route_projection = serde_json::json!({
             "credential": &embedded_status,
             "endpoint_binding": "oneclick",
@@ -184,5 +186,36 @@ mod tests {
         assert_eq!(unconfigured_status.source, CredentialSource::Unconfigured);
         assert_eq!(unconfigured_status.storage, "none");
         assert!(!unconfigured_status.configured);
+    }
+
+    #[test]
+    fn malformed_candidates_return_structured_status_but_execution_stays_strict() {
+        let malformed_private = "private.test.jwt must-never-appear";
+        let malformed_embedded = "embedded.test.jwt must-never-appear";
+
+        let private_status = status(
+            Some(malformed_private.as_bytes()),
+            Some("valid.embedded.fallback"),
+        );
+        assert!(!private_status.configured);
+        assert_eq!(private_status.source, CredentialSource::PrivateStore);
+        assert_eq!(private_status.storage, "persistent_private_store");
+        assert!(
+            resolve_partner_jwt(
+                Some(malformed_private.as_bytes()),
+                Some("valid.embedded.fallback")
+            )
+            .is_err()
+        );
+
+        let embedded_status = status(None, Some(malformed_embedded));
+        assert!(!embedded_status.configured);
+        assert_eq!(embedded_status.source, CredentialSource::EmbeddedPartner);
+        assert_eq!(embedded_status.storage, "release_artifact");
+        assert!(resolve_partner_jwt(None, Some(malformed_embedded)).is_err());
+
+        let public_output = serde_json::to_string(&(private_status, embedded_status)).unwrap();
+        assert!(!public_output.contains(malformed_private));
+        assert!(!public_output.contains(malformed_embedded));
     }
 }

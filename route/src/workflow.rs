@@ -66,7 +66,7 @@ pub fn write_api_key<H: Host>(host: &mut H, body: &[u8]) -> Result<(), String> {
 }
 pub fn credential_status<H: Host>(host: &mut H) -> Result<settings::CredentialStatus, String> {
     let private_store = host.get_secret(settings::JWT_KEY, 8192)?;
-    settings::configured_status(private_store.as_deref())
+    Ok(settings::configured_status(private_store.as_deref()))
 }
 
 fn wallet_details<H: Host>(host: &mut H, wallet: &str) -> Result<(String, String), String> {
