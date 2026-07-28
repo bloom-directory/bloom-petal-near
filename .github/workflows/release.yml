@@ -10,10 +10,10 @@ jobs:
     permissions:
       contents: write
     # Pin both the workflow and its CLI tooling to the same immutable commit.
-    uses: bloom-directory/petal/.github/workflows/release-petal.yml@59cd6309341d16138e9eb4d8586177cb73d388ee
+    uses: bloom-directory/petal/.github/workflows/release-petal.yml@ec8fe8e445073e4cbef8a62bb27ab88feca32ef6
     with:
       petal-name: near-intents
-      petal-tooling-ref: "59cd6309341d16138e9eb4d8586177cb73d388ee"
+      petal-tooling-ref: "ec8fe8e445073e4cbef8a62bb27ab88feca32ef6"
       build-command: scripts/build.sh
       expected-route-count: 24
     secrets:
