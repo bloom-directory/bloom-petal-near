@@ -494,7 +494,7 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
                     Ok(staged) => {
                         s.outbox_id = Some(staged.outbox_id);
                         s.plan_md = Some(staged.plan_md);
-                        s.approval=staged.approval.map(|a|serde_json::json!({"action_id":a.action_id,"ceremony_url":a.ceremony_url,"expires_ms":a.expires_ms}));
+                        s.approval=staged.approval.map(|a|serde_json::json!({"action_id":a.action_id,"expires_ms":a.expires_ms}));
                         s.staging_started = false;
                         s.transition(now, "staged", "Bloom outbox transaction staged");
                         save(host, &s)
@@ -521,7 +521,9 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
                     c.acknowledge_warnings,
                 )?;
                 s.plan_md = Some(out.plan_md);
-                s.approval=out.approval.map(|a|serde_json::json!({"action_id":a.action_id,"ceremony_url":a.ceremony_url,"expires_ms":a.expires_ms}));
+                s.approval = out.approval.map(
+                    |a| serde_json::json!({"action_id":a.action_id,"expires_ms":a.expires_ms}),
+                );
                 let next = if s.approval.is_some() {
                     "approval_required"
                 } else {

@@ -12,7 +12,12 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         Ok(session) => session
             .approval
             .as_ref()
-            .map(petal::read_json_value)
+            .map(|approval| {
+                petal::read_json_value(&serde_json::json!({
+                    "action_id": approval["action_id"],
+                    "expires_ms": approval["expires_ms"],
+                }))
+            })
             .unwrap_or_else(|| petal::error(-1, "no approval pending")),
         Err(error) => petal::error(-1, error),
     }
