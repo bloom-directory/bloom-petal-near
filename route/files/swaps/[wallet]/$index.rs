@@ -3,9 +3,9 @@ petal::route_file!(
     ctx_list: |ctx: &petal::Ctx| {
         use crate::workflow::Host;
 
-        let wallet = petal::param(ctx, "wallet")?;
+        let wallet = petal::wallet_param(ctx)?;
         let prefix = format!("swaps/{wallet}/");
-        let mut host = crate::workflow::BloomHost;
+        let mut host = crate::workflow::BloomHost::default();
         let keys = host
             .list(&prefix, 1024 * 1024)
             .map_err(|error| petal::error(-4, error))?;

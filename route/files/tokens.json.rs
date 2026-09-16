@@ -1,5 +1,5 @@
 petal::route_file!(spec: petal::http_read_spec(30_000), read: |_ctx: &petal::Ctx| {
-    let mut host = crate::workflow::BloomHost;
+    let mut host = crate::workflow::BloomHost::default();
     match crate::api::tokens(&mut host) {
         Ok((tokens, _raw)) => petal::read_json_value(
             &tokens

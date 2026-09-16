@@ -1,5 +1,5 @@
 petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
-    let wallet = match petal::param(ctx, "wallet") {
+    let wallet = match petal::wallet_param(ctx) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -7,7 +7,7 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         Ok(value) => value,
         Err(response) => return response,
     };
-    let mut host = crate::workflow::BloomHost;
+    let mut host = crate::workflow::BloomHost::default();
     let session = match crate::workflow::load(&mut host, wallet, id) {
         Ok(value) => value,
         Err(error) => return petal::error(-1, error),
@@ -25,9 +25,12 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
     let transaction = session.prepared_transaction.as_ref();
     petal::DispatchResponse::Read(
         format!(
-            "# NEAR Intents 1Click swap\n\nFunds will be transferred temporarily into the signed 1Click swapping flow.\n\n- Wallet: `{}` (`{}`)\n- Origin: `{}` (chain ID {})\n- Input: {} {} (`{}` decimals), contract: `{}`\n- Deposit amount: `{}`; informational USD estimate: `{}`\n- Destination asset: `{}`\n- Recipient: `{}`\n- Quoted/min output: `{}` / `{}`\n- Slippage: {} bps\n- Refund address: `{}`; refund fee: `{}`\n- Withdrawal fee: `{}`; estimated execution: {} seconds\n- Signed deposit address: `{}`\n- Quote verified: {}\n- Correlation ID: `{}`\n- Quote hash: `{}`\n- Deadline / inactive time: `{}` / `{}`\n- EVM to/value/data: `{}` / `{}` / `{}`\n\nWarnings: NEAR Intents has no testnet; mainnet broadcasting remains controlled by Bloom opt-in; settlement may take minutes.\n",
+            "# NEAR Intents 1Click swap\n\nFunds will be transferred temporarily into the signed 1Click swapping flow.\n\n- Wallet: `{}` (`{}`)\n- Account number / fingerprint / path: `{}` / `{}` / `{}`\n- Origin: `{}` (chain ID {})\n- Input: {} {} (`{}` decimals), contract: `{}`\n- Deposit amount: `{}`; informational USD estimate: `{}`\n- Destination asset: `{}`\n- Recipient: `{}`\n- Quoted/min output: `{}` / `{}`\n- Slippage: {} bps\n- Refund address: `{}`; refund fee: `{}`\n- Withdrawal fee: `{}`; estimated execution: {} seconds\n- Signed deposit address: `{}`\n- Quote verified: {}\n- Correlation ID: `{}`\n- Quote hash: `{}`\n- Deadline / inactive time: `{}` / `{}`\n- EVM to/value/data: `{}` / `{}` / `{}`\n\nWarnings: NEAR Intents has no testnet; mainnet broadcasting remains controlled by Bloom opt-in; settlement may take minutes.\n",
             session.wallet,
             session.wallet_address,
+            session.account.as_ref().map(|a| a.number.to_string()).unwrap_or_else(|| "unbound legacy session".into()),
+            session.account.as_ref().map(|a| a.fingerprint.as_str()).unwrap_or("unbound"),
+            session.account.as_ref().map(|a| a.derivation_path.as_str()).unwrap_or("unbound"),
             origin.bloom_chain,
             origin.expected_chain_id,
             origin.symbol,

@@ -1,7 +1,7 @@
 petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
     use crate::workflow::Host;
 
-    let wallet = match petal::param(ctx, "wallet") {
+    let wallet = match petal::wallet_param(ctx) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -9,7 +9,7 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         Ok(value) => value,
         Err(response) => return response,
     };
-    let mut host = crate::workflow::BloomHost;
+    let mut host = crate::workflow::BloomHost::default();
     match crate::workflow::load(&mut host, wallet, id) {
         Ok(session) => petal::read_json_value(&serde_json::json!({
             "id": session.id,

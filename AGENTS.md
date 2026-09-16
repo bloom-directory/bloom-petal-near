@@ -26,3 +26,15 @@ Never run a live-money swap without explicit user authorization.
 - After changing route or domain code, run
   `scripts/check-route-architecture.sh`, route tests and Clippy,
   `scripts/build.sh`, and `petal check --root .`.
+
+## Bloom v0.3 account contract
+
+- Follow `docs/bloom-v0.3-migration.md` for the release-candidate contract and
+  the Bloom-owned trusted-dispatch blocker.
+- Resolve account numbers from the intended fingerprint and derivation path in
+  `wallets/<wallet>/accounts.json`. Never select by list position or default to 0.
+- Chain leaves and outbox artifacts are under
+  `wallets/<wallet>/<n>/chains/<chain>/`; Solana address/balance leaves are direct
+  children of that directory. EVM addresses are `<n>/address.evm`.
+- Consume host-injected account context only. Never construct reserved `bloom.*`
+  parameters. Keep transaction writes on the canonical SDK host imports.

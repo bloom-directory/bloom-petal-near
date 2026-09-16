@@ -5,6 +5,12 @@
 **Target:** `bloom-petal-near`
 **Bloom compatibility:** Petal package v1, `bloom:route@0.1.0`
 
+**v0.3 migration amendment:** [Account selection, numbered wallet paths, and
+trusted-dispatch blocker](bloom-v0.3-migration.md) supersede the original wallet
+identity and confirmation-retry assumptions below. New sessions require exact
+account fingerprint/path binding. Runtime execution is blocked until Bloom
+provides trusted account dispatch at the root Petal mount.
+
 ## 1. Decision
 
 Build a Bloom Petal package mounted at `/petals/near-intents` that executes

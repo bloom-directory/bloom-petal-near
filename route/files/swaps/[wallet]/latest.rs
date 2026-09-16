@@ -1,11 +1,11 @@
 petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
     use crate::workflow::Host;
 
-    let wallet = match petal::param(ctx, "wallet") {
+    let wallet = match petal::wallet_param(ctx) {
         Ok(value) => value,
         Err(response) => return response,
     };
-    let mut host = crate::workflow::BloomHost;
+    let mut host = crate::workflow::BloomHost::default();
     match host.get(&format!("swaps/{wallet}/latest"), 128) {
         Ok(Some(value)) => petal::DispatchResponse::Read(value),
         Ok(None) => petal::error(-1, "no swap session"),

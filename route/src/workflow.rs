@@ -69,7 +69,7 @@ pub fn credential_status<H: Host>(host: &mut H) -> Result<settings::CredentialSt
     Ok(settings::configured_status(private_store.as_deref()))
 }
 
-fn wallet_details<H: Host>(host: &mut H, wallet: &str) -> Result<(String, String), String> {
+fn wallet_details<H: Host>(host: &mut H, wallet: &str) -> Result<(), String> {
     if wallet.is_empty()
         || wallet.len() > 128
         || !wallet
@@ -78,11 +78,6 @@ fn wallet_details<H: Host>(host: &mut H, wallet: &str) -> Result<(String, String
     {
         return Err("wallet name is invalid".into());
     }
-    let address = String::from_utf8(host.vfs_read(&format!("wallets/{wallet}/address"), 128)?)
-        .map_err(|_| "wallet address is not UTF-8")?
-        .trim()
-        .to_string();
-    assets::validate_address(&address)?;
     let kind = String::from_utf8(host.vfs_read(&format!("wallets/{wallet}/kind"), 64)?)
         .map_err(|_| "wallet kind is not UTF-8")?
         .trim()
@@ -90,7 +85,7 @@ fn wallet_details<H: Host>(host: &mut H, wallet: &str) -> Result<(String, String
     if kind == "watch" {
         return Err("watch-only wallets cannot create executable swaps".into());
     }
-    Ok((address, kind))
+    Ok(())
 }
 
 fn iso_deadline(now_ms: u64, seconds: u32) -> Result<String, String> {
@@ -214,6 +209,8 @@ fn address_word(address: &str) -> Result<String, String> {
 fn preflight<H: Host>(
     host: &mut H,
     origin: &assets::ResolvedOrigin,
+    wallet_id: &str,
+    account: &crate::accounts::AccountBinding,
     wallet: &str,
     amount: &str,
 ) -> Result<(), String> {
@@ -223,11 +220,20 @@ fn preflight<H: Host>(
     if chain_id != alloy::primitives::U256::from(origin.expected_chain_id) {
         return Err("live chain ID does not match origin token".into());
     }
-    let native = parse_hex_quantity(&host.chain_read(
-        &origin.bloom_chain,
-        "eth_getBalance",
-        &serde_json::json!([wallet, "latest"]).to_string(),
-    )?)?;
+    let balance = host.vfs_read(
+        &format!(
+            "wallets/{wallet_id}/{}/chains/{}/balance.raw",
+            account.number, origin.bloom_chain
+        ),
+        128,
+    )?;
+    let native = alloy::primitives::U256::from_str_radix(
+        std::str::from_utf8(&balance)
+            .map_err(|_| "balance is not UTF-8")?
+            .trim(),
+        10,
+    )
+    .map_err(|_| "balance is not a decimal quantity")?;
     let wanted = alloy::primitives::U256::from_str_radix(amount, 10)
         .map_err(|_| "amount exceeds uint256")?;
     if let Some(contract) = &origin.contract_address {
@@ -278,7 +284,10 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
     let req: NewSwapRequest =
         serde_json::from_slice(body).map_err(|e| format!("swap request JSON: {e}"))?;
     req.validate()?;
-    let (wallet_address, _) = wallet_details(host, wallet)?;
+    wallet_details(host, wallet)?;
+    let account =
+        crate::accounts::bind(host, wallet, &req.account_fingerprint, &req.derivation_path)?;
+    let wallet_address = crate::accounts::address(host, wallet, &account)?;
     if req
         .refund_to
         .as_deref()
@@ -333,13 +342,21 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
         let (quote, raw) = api::quote(host, &jwt, &sent)?;
         let hash = verifier(&quote)?;
         validate_echo(&sent, &quote, &wallet_address, now)?;
-        preflight(host, &origin, &wallet_address, &quote.quote.amount_in)?;
+        preflight(
+            host,
+            &origin,
+            wallet,
+            &account,
+            &wallet_address,
+            &quote.quote.amount_in,
+        )?;
         host.put(&format!("swaps/{wallet}/{id}/quote.raw.json"), &raw, false)?;
         let mut s = Session {
-            schema_version: 1,
+            schema_version: 2,
             id: id.clone(),
             wallet: wallet.into(),
             wallet_address,
+            account: Some(account),
             created_ms: now,
             updated_ms: now,
             state: "quoted".into(),
@@ -380,7 +397,7 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
     })();
     if let Err(error) = &result {
         let failure = session::FailedSession {
-            schema_version: 1,
+            schema_version: 2,
             id: id.clone(),
             wallet: wallet.into(),
             created_ms: now,
@@ -447,21 +464,35 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
     let result = (|| {
         let now = host.now_ms();
         let mut s = load(host, wallet, id)?;
+        crate::accounts::revalidate(host, &s)?;
         if s.terminal() {
             return Err("session is terminal".into());
+        }
+        if matches!(
+            s.state.as_str(),
+            "deposit_broadcast_pending" | "deposit_sent"
+        ) {
+            return inspect_outbox(host, &mut s);
         }
         validate_echo(&s.quote.quote_request, &s.quote, &s.wallet_address, now)?;
         verifier(&s.quote)?;
         match s.state.as_str() {
             "quoted" => {
-                preflight(host, &s.origin, &s.wallet_address, &s.quote.quote.amount_in)?;
+                preflight(
+                    host,
+                    &s.origin,
+                    &s.wallet,
+                    s.account.as_ref().ok_or("account binding missing")?,
+                    &s.wallet_address,
+                    &s.quote.quote.amount_in,
+                )?;
                 let tx = evm::prepare(
                     s.origin.contract_address.as_deref(),
                     s.quote.quote.deposit_address.as_deref().unwrap(),
                     &s.quote.quote.amount_in,
                 )?;
                 let digest = hex::encode(Sha256::digest(json(
-                    &serde_json::json!({"petal":"near-intents","session":s.id,"wallet":s.wallet,"wallet_address":s.wallet_address,"chain":s.origin.bloom_chain,"chain_id":s.origin.expected_chain_id,"asset":s.origin.asset_id,"contract":s.origin.contract_address,"deposit":s.quote.quote.deposit_address,"amount":s.quote.quote.amount_in,"transaction":tx,"correlation_id":s.quote.correlation_id,"quote_hash":s.quote_hash,"signature":s.quote.signature,"deadline":s.quote.quote.deadline,"destination":s.quote.quote_request.destination_asset,"recipient":s.quote.quote_request.recipient,"min_output":s.quote.quote.min_amount_out,"refund":s.quote.quote_request.refund_to}),
+                    &serde_json::json!({"petal":"near-intents","session":s.id,"wallet":s.wallet,"wallet_address":s.wallet_address,"account":s.account,"chain":s.origin.bloom_chain,"chain_id":s.origin.expected_chain_id,"asset":s.origin.asset_id,"contract":s.origin.contract_address,"deposit":s.quote.quote.deposit_address,"amount":s.quote.quote.amount_in,"transaction":tx,"correlation_id":s.quote.correlation_id,"quote_hash":s.quote_hash,"signature":s.quote.signature,"deadline":s.quote.quote.deadline,"destination":s.quote.quote_request.destination_asset,"recipient":s.quote.quote_request.recipient,"min_output":s.quote.quote.min_amount_out,"refund":s.quote.quote_request.refund_to}),
                 )?));
                 s.prepared_transaction = Some(tx);
                 s.prepared_digest = Some(digest);
@@ -469,7 +500,14 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
                 save(host, &s)
             }
             "prepared" => {
-                preflight(host, &s.origin, &s.wallet_address, &s.quote.quote.amount_in)?;
+                preflight(
+                    host,
+                    &s.origin,
+                    &s.wallet,
+                    s.account.as_ref().ok_or("account binding missing")?,
+                    &s.wallet_address,
+                    &s.quote.quote.amount_in,
+                )?;
                 s.staging_started = true;
                 s.transition(
                     now,
@@ -512,8 +550,22 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
                 }
             }
             "staged" | "approval_required" => {
-                preflight(host, &s.origin, &s.wallet_address, &s.quote.quote.amount_in)?;
+                preflight(
+                    host,
+                    &s.origin,
+                    &s.wallet,
+                    s.account.as_ref().ok_or("account binding missing")?,
+                    &s.wallet_address,
+                    &s.quote.quote.amount_in,
+                )?;
+                crate::outbox::verify_owned(host, &s)?;
                 let id = s.outbox_id.clone().ok_or("outbox ID missing")?;
+                s.transition(
+                    now,
+                    "deposit_broadcast_pending",
+                    "durable marker before confirmation; reconcile on ambiguous result",
+                );
+                save(host, &s)?;
                 let out = host.tx_confirm(
                     &s.wallet,
                     &s.origin.bloom_chain,
@@ -544,6 +596,7 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
 }
 
 fn inspect_outbox<H: Host>(host: &mut H, s: &mut Session) -> Result<(), String> {
+    crate::outbox::verify_owned(host, s)?;
     let id = s.outbox_id.clone().ok_or("outbox ID missing")?;
     let i = host.tx_inspect(&s.wallet, &s.origin.bloom_chain, &id)?;
     s.outbox_state = Some(i.state.clone());
@@ -590,6 +643,7 @@ fn refresh_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
     let lock_token = acquire_lock(host, &lock_key, 120_000)?;
     let result = (|| {
         let mut s = load(host, wallet, id)?;
+        crate::accounts::revalidate(host, &s)?;
         if s.terminal() {
             return Ok(());
         }
@@ -706,6 +760,7 @@ pub fn abandon<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<(), Stri
     let lock_token = acquire_lock(host, &lock_key, 120_000)?;
     let result = (|| {
         let mut s = load(host, wallet, id)?;
+        crate::accounts::revalidate(host, &s)?;
         if s.outbox_id.is_some()
             || matches!(
                 s.state.as_str(),
@@ -749,6 +804,13 @@ mod workflow_tests {
         inspect_pending: bool,
         malformed_status: bool,
         inspect_denied: bool,
+        missing_account: bool,
+        wrong_account: bool,
+        confirm_fails: bool,
+        approval_required: bool,
+        wrong_outbox_sender: bool,
+        staged_tx: Option<EvmTransaction>,
+        outbox_location: Option<String>,
     }
 
     #[derive(Clone)]
@@ -802,6 +864,16 @@ mod workflow_tests {
     }
 
     impl Host for MockHost {
+        fn trusted_account(&self) -> Option<crate::accounts::TrustedAccount> {
+            if self.0.borrow().missing_account {
+                return None;
+            }
+            Some(crate::accounts::TrustedAccount {
+                wallet: "alice".into(),
+                number: if self.0.borrow().wrong_account { 8 } else { 7 },
+                fingerprint: "aa".repeat(32),
+            })
+        }
         fn now_ms(&mut self) -> u64 {
             1_800_000_000_000
         }
@@ -912,7 +984,24 @@ mod workflow_tests {
             Ok(())
         }
         fn vfs_read(&mut self, path: &str, _: usize) -> Result<Vec<u8>, String> {
-            if path.ends_with("/address") {
+            if path == "wallets/alice/accounts.json" {
+                Ok(serde_json::to_vec(&serde_json::json!({"wallet_id":"alice","accounts":[{"number":7,"public_key_fingerprint":"aa".repeat(32),"path":"m/44'/60'/0'/0/7","derivation_profile":"bip44-evm-secp256k1-v1","lifecycle":"active"}]})).unwrap())
+            } else if path == "wallets/alice/7/chains/ethereum/balance.raw" {
+                Ok(b"18446744073709551615\n".to_vec())
+            } else if path
+                == format!(
+                    "wallets/alice/7/chains/ethereum/outbox/{}/outbox-1/intent.json",
+                    self.0
+                        .borrow()
+                        .outbox_location
+                        .as_deref()
+                        .unwrap_or("pending")
+                )
+            {
+                let shared = self.0.borrow();
+                let tx = shared.staged_tx.as_ref().ok_or("no staged transaction")?;
+                Ok(serde_json::to_vec(&serde_json::json!({"id":"outbox-1","wallet":"alice","chain":"ethereum","chain_id":1,"from":if shared.wrong_outbox_sender { DEPOSIT } else { WALLET },"to":tx.to,"value_wei":tx.value_wei,"data_hex":tx.data_hex})).unwrap())
+            } else if path == "wallets/alice/7/address.evm" {
                 Ok(WALLET.as_bytes().into())
             } else if path.ends_with("/kind") {
                 Ok(b"passkey".into())
@@ -923,7 +1012,7 @@ mod workflow_tests {
         fn chain_read(&mut self, _: &str, method: &str, params: &str) -> Result<String, String> {
             Ok(match method {
                 "eth_chainId" => r#""0x1""#,
-                "eth_getBalance" => r#""0xffffffffffffffff""#,
+
                 "eth_getCode" => r#""0x6000""#,
                 "eth_call" if params.contains("313ce567") => r#""0x12""#,
                 "eth_call" => r#""0xffffffffffffffff""#,
@@ -934,6 +1023,7 @@ mod workflow_tests {
         fn tx_stage(&mut self, tx: &EvmTransaction) -> Result<StagedTransaction, String> {
             let mut s = self.0.borrow_mut();
             s.stage_calls += 1;
+            s.staged_tx = Some(tx.clone());
             if s.stage_fails {
                 return Err("backend timeout".into());
             }
@@ -958,10 +1048,20 @@ mod workflow_tests {
         ) -> Result<StagedTransaction, String> {
             assert_eq!(id, "outbox-1");
             self.0.borrow_mut().confirm_calls += 1;
+            if self.0.borrow().confirm_fails {
+                return Err("broadcast response lost".into());
+            }
             Ok(StagedTransaction {
                 outbox_id: id.into(),
                 plan_md: "# Bloom outbox plan confirmed".into(),
-                approval: None,
+                approval: self
+                    .0
+                    .borrow()
+                    .approval_required
+                    .then(|| petal::sdk::OutboxApproval {
+                        action_id: "broker-approval".into(),
+                        expires_ms: 1_800_000_100_000,
+                    }),
             })
         }
         fn tx_inspect(&mut self, _: &str, _: &str, id: &str) -> Result<OutboxInspection, String> {
@@ -993,7 +1093,7 @@ mod workflow_tests {
         drop(host);
         let mut restarted = MockHost(shared.clone());
         assert!(credential_status(&mut restarted).unwrap().configured);
-        let request = serde_json::json!({"session_id":"test-e2e-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":"recipient-on-destination","deadline_seconds":900});
+        let request = serde_json::json!({"account_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","derivation_path":"m/44'/60'/0'/0/7","session_id":"test-e2e-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":"recipient-on-destination","deadline_seconds":900});
         let id = create_with_verifier(
             &mut restarted,
             "alice",
@@ -1080,7 +1180,7 @@ mod workflow_tests {
 
     #[test]
     fn accepts_upstream_insured_false_but_rejects_true() {
-        let request = serde_json::json!({"session_id":"test-insured-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":"recipient-on-destination","deadline_seconds":900});
+        let request = serde_json::json!({"account_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","derivation_path":"m/44'/60'/0'/0/7","session_id":"test-insured-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":"recipient-on-destination","deadline_seconds":900});
 
         for (insured, succeeds) in [(false, true), (true, false)] {
             let shared = Rc::new(RefCell::new(Shared {
@@ -1108,7 +1208,7 @@ mod workflow_tests {
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
         let body = serde_json::to_vec(&serde_json::json!({
-            "session_id":"test-session-lock",
+            "account_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","derivation_path":"m/44'/60'/0'/0/7","session_id":"test-session-lock",
             "swap_type":"EXACT_INPUT",
             "origin_asset":"nep141:eth.omft.near",
             "destination_asset":"dest",
@@ -1141,7 +1241,7 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared);
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"test-erc20-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"account_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","derivation_path":"m/44'/60'/0'/0/7","session_id":"test-erc20-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
         let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
         confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
         let tx = load(&mut host, "alice", &id)
@@ -1161,7 +1261,7 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"test-ambiguous-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"account_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","derivation_path":"m/44'/60'/0'/0/7","session_id":"test-ambiguous-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
         let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
         confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
         assert!(confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).is_err());
@@ -1181,7 +1281,7 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared);
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"test-failure-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"account_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","derivation_path":"m/44'/60'/0'/0/7","session_id":"test-failure-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
         assert!(create_with_verifier(&mut host, "alice", &body, test_verify).is_err());
         let id = "test-failure-session";
         let raw = host
@@ -1198,7 +1298,7 @@ mod workflow_tests {
         let shared = Rc::new(RefCell::new(Shared::default()));
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"caller-known-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"account_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","derivation_path":"m/44'/60'/0'/0/7","session_id":"caller-known-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
         assert_eq!(
             create_with_verifier(&mut host, "alice", &body, test_verify).unwrap(),
             "caller-known-session"
@@ -1216,7 +1316,7 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"pending-outbox-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"account_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","derivation_path":"m/44'/60'/0'/0/7","session_id":"pending-outbox-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
         let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
         confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
         confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
@@ -1236,7 +1336,7 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"status-error-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"account_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","derivation_path":"m/44'/60'/0'/0/7","session_id":"status-error-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
         let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
         for _ in 0..3 {
             confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
@@ -1253,7 +1353,7 @@ mod workflow_tests {
         let shared = Rc::new(RefCell::new(Shared::default()));
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"migrated-sent-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"account_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","derivation_path":"m/44'/60'/0'/0/7","session_id":"migrated-sent-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
         let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
         for _ in 0..3 {
             confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
@@ -1271,5 +1371,180 @@ mod workflow_tests {
             "settled_success"
         );
         assert_eq!(shared.borrow().status_calls, 1);
+    }
+    fn bound_session(host: &mut MockHost) -> String {
+        write_api_key(host, JWT.as_bytes()).unwrap();
+        let request = serde_json::json!({"account_fingerprint":"aa".repeat(32),"derivation_path":"m/44'/60'/0'/0/7","session_id":"bound-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient"});
+        create_with_verifier(
+            host,
+            "alice",
+            &serde_json::to_vec(&request).unwrap(),
+            test_verify,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn missing_or_mismatched_context_rejects_before_quote() {
+        for missing in [true, false] {
+            let shared = Rc::new(RefCell::new(Shared::default()));
+            shared.borrow_mut().missing_account = missing;
+            shared.borrow_mut().wrong_account = !missing;
+            let mut host = MockHost(shared.clone());
+            let request = serde_json::json!({"account_fingerprint":"aa".repeat(32),"derivation_path":"m/44'/60'/0'/0/7","session_id":"bound-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient"});
+            assert!(
+                create_with_verifier(
+                    &mut host,
+                    "alice",
+                    &serde_json::to_vec(&request).unwrap(),
+                    test_verify
+                )
+                .unwrap_err()
+                .contains("account")
+            );
+            assert_eq!(shared.borrow().quote_calls, 0);
+            assert_eq!(shared.borrow().stage_calls, 0);
+        }
+    }
+
+    #[test]
+    fn account_change_rejects_prepare_stage_authorization_and_submission() {
+        for transitions in 0..=3 {
+            let shared = Rc::new(RefCell::new(Shared::default()));
+            let mut host = MockHost(shared.clone());
+            let id = bound_session(&mut host);
+            for _ in 0..transitions {
+                confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+            }
+            let before = (shared.borrow().stage_calls, shared.borrow().confirm_calls);
+            shared.borrow_mut().wrong_account = true;
+            assert!(
+                confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify)
+                    .unwrap_err()
+                    .contains("account")
+            );
+            assert!(
+                refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify)
+                    .unwrap_err()
+                    .contains("account")
+            );
+            assert_eq!(
+                (shared.borrow().stage_calls, shared.borrow().confirm_calls),
+                before
+            );
+            assert_eq!(shared.borrow().submit_calls, 0);
+        }
+    }
+
+    #[test]
+    fn ambiguous_confirmation_reconciles_without_another_broadcast_even_after_expiry() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        for _ in 0..2 {
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        }
+        shared.borrow_mut().confirm_fails = true;
+        assert!(confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).is_err());
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "deposit_broadcast_pending"
+        );
+        // Inspection must not depend on a still-executable quote.
+        let mut session = load(&mut host, "alice", &id).unwrap();
+        session.quote.quote.deadline = Some("2000-01-01T00:00:00Z".into());
+        save(&mut host, &session).unwrap();
+        let mut restarted = MockHost(shared.clone());
+        confirm_with_verifier(&mut restarted, "alice", &id, b"confirm", test_verify).unwrap();
+        assert_eq!(shared.borrow().confirm_calls, 1);
+        assert_eq!(
+            load(&mut restarted, "alice", &id)
+                .unwrap()
+                .origin_tx_hash
+                .as_deref(),
+            Some("0xabc")
+        );
+    }
+
+    #[test]
+    fn broker_approval_retries_the_same_outbox_without_restaging() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        for _ in 0..2 {
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        }
+        shared.borrow_mut().approval_required = true;
+        confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        let pending = load(&mut host, "alice", &id).unwrap();
+        assert_eq!(pending.state, "approval_required");
+        assert_eq!(pending.approval.unwrap()["action_id"], "broker-approval");
+        shared.borrow_mut().approval_required = false;
+        confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().outbox_id,
+            pending.outbox_id
+        );
+        assert_eq!(shared.borrow().stage_calls, 1);
+        assert_eq!(shared.borrow().confirm_calls, 2);
+    }
+
+    #[test]
+    fn legacy_unbound_session_remains_readable_but_cannot_execute() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        let session = load(&mut host, "alice", &id).unwrap();
+        let mut raw = serde_json::to_value(&session).unwrap();
+        raw.as_object_mut().unwrap().remove("account");
+        raw["request"]
+            .as_object_mut()
+            .unwrap()
+            .remove("account_fingerprint");
+        raw["request"]
+            .as_object_mut()
+            .unwrap()
+            .remove("derivation_path");
+        host.put(&session.key(), &serde_json::to_vec(&raw).unwrap(), false)
+            .unwrap();
+        assert!(load(&mut host, "alice", &id).unwrap().account.is_none());
+        assert!(
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify)
+                .unwrap_err()
+                .contains("legacy session")
+        );
+        assert_eq!(shared.borrow().stage_calls, 0);
+    }
+    #[test]
+    fn outbox_sender_mismatch_cannot_be_confirmed_or_submitted() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        for _ in 0..2 {
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        }
+        shared.borrow_mut().wrong_outbox_sender = true;
+        assert!(confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).is_err());
+        assert!(refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).is_err());
+        assert_eq!(shared.borrow().confirm_calls, 0);
+        assert_eq!(shared.borrow().submit_calls, 0);
+    }
+    #[test]
+    fn reconciliation_finds_outbox_after_moving_out_of_pending() {
+        for location in ["sent", "failed"] {
+            let shared = Rc::new(RefCell::new(Shared::default()));
+            let mut host = MockHost(shared.clone());
+            let id = bound_session(&mut host);
+            for _ in 0..2 {
+                confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+            }
+            shared.borrow_mut().outbox_location = Some(location.into());
+            crate::outbox::verify_owned(
+                &mut host,
+                &load(&mut MockHost(shared.clone()), "alice", &id).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(shared.borrow().confirm_calls, 0);
+        }
     }
 }
