@@ -5,7 +5,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BLOOM_REPO="${BLOOM_REPO:-}"
 
 "$ROOT/scripts/check-route-architecture.sh"
-cargo test --manifest-path "$ROOT/route/Cargo.toml"
+cargo test --manifest-path "$ROOT/route/Cargo.toml" --locked
+cargo clippy --manifest-path "$ROOT/route/Cargo.toml" --locked --all-targets -- -D warnings
 "$ROOT/scripts/build.sh"
 
 if [[ -n "${PETAL_BIN:-}" ]]; then
@@ -28,10 +29,9 @@ if rg -q 'test\.jwt\.must-never-appear' \
 fi
 
 if [ -n "$BLOOM_REPO" ]; then
-  cargo run --manifest-path "$BLOOM_REPO/Cargo.toml" -p bloom -- petals build "$ROOT"
+  cargo build --manifest-path "$BLOOM_REPO/Cargo.toml" -p bloom --locked
   BLOOM_BIN="$BLOOM_REPO/target/debug/bloom" "$ROOT/scripts/e2e-cli.sh"
 elif command -v bloom >/dev/null 2>&1; then
-  bloom petals build "$ROOT"
   "$ROOT/scripts/e2e-cli.sh"
 else
   echo "set BLOOM_REPO=/path/to/bloom or install bloom to validate the package" >&2

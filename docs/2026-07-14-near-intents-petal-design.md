@@ -5,6 +5,11 @@
 **Target:** `bloom-petal-near`
 **Bloom compatibility:** Petal package v1, `bloom:route@0.1.0`
 
+**v0.3 migration amendment:** [Wallet-scoped account-0 paths and validation](bloom-v0.3-migration.md)
+supersede the original wallet identity and confirmation-retry assumptions below.
+Only account 0 within the selected wallet is supported; account awareness is
+reserved for a future change.
+
 ## 1. Decision
 
 Build a Bloom Petal package mounted at `/petals/near-intents` that executes
@@ -148,6 +153,12 @@ The Petal omits `appFees`, `rebates`, `insured`, `confidentiality`,
 The live API may echo an omitted `insured` request field as `false`. The Petal
 accepts absent or `false` because `insured` is excluded from the official SDK's
 signed projection, but rejects `true` as unsupported execution metadata.
+The live API may also add one unassociated protocol `appFees` entry. The Petal
+accepts it only when its recipient is a 2–64 byte lowercase Intents-account
+identifier (`a-z`, `0-9`, `.`, `_`, or `-`), `limitOrderId` is absent or null,
+and its fee is at most 40 bps. It rejects multiple fees, associated limit-order
+fees, malformed recipients, and any fee above that cap; accepted recipients are
+also Markdown-escaped in the review material.
 The unknown-field policy in section 4.3 controls schema evolution; retaining
 raw response evidence does not make an unknown field acceptable for execution.
 
@@ -617,6 +628,7 @@ Before staging, `plan.md` must clearly show:
 - destination asset, recipient, quoted output, minimum output, and estimated
   execution time;
 - slippage, refund address, refund fee, withdrawal fee, and deadlines;
+- any accepted upstream application fee, including recipient and basis points;
 - signed deposit address and quote verification status;
 - quote correlation ID and local quote digest;
 - the exact EVM `to`, value, and decoded operation;

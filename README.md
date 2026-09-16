@@ -15,6 +15,8 @@ repository does not carry a private WIT, SDK, or builder copy.
 cargo test --manifest-path route/Cargo.toml
 scripts/build.sh
 BLOOM_REPO=/path/to/bloom scripts/validate.sh
+# Or run the isolated daemon/package smoke test with an already built binary:
+BLOOM_BIN=/path/to/bloom scripts/e2e-cli.sh
 ```
 
 After installation, write the 1Click partner JWT once to
@@ -30,15 +32,14 @@ authorization and a deliberately funded low-value wallet.
 
 ## Releases
 
-Installable Petal packages are built and published by this repository. The
-first release is `v0.1.0`; later releases use immutable SemVer tags. Create the
-tag from a reviewed commit on `master` and push it to GitHub. The tag workflow
-calls the canonical reusable release workflow from
+Installable Petal packages are built and published by this repository using
+immutable SemVer tags. Create a tag from a reviewed commit on `master` and push
+it to GitHub. The tag workflow calls the canonical reusable release workflow from
 [`bloom-directory/petal`](https://github.com/bloom-directory/petal), which
 builds and validates the package before attaching these files to the GitHub
 release:
 
-- `near-intents-v0.1.0.petal.tar.gz`
+- `near-intents-v<version>.petal.tar.gz`
 - `SHA256SUMS`
 - `petal-release.json`
 
@@ -49,3 +50,28 @@ release tag, source commit, asset name, and SHA-256 digest. They must not use
 The two references in `.github/workflows/release.yml` pin the same full commit
 SHA containing the canonical reusable workflow and Petal tooling. Keep both
 references immutable and update them together when changing release machinery.
+
+## Wallets and transactions
+
+Swaps use **account 0** of the wallet selected by the route. Supported origins
+are EVM chains; Solana addresses can be used as destination recipients.
+
+Wallet paths:
+
+- EVM address: `/wallets/<wallet>/0/address.evm`.
+- EVM native balance: `/wallets/<wallet>/0/chains/<chain>/balance.raw`.
+- Outbox staging: `/wallets/<wallet>/0/chains/<chain>/outbox/new.tx`.
+- Outbox entries: `/wallets/<wallet>/0/chains/<chain>/outbox/<pending|sent|failed>/<id>/`.
+- Solana recipient discovery: direct `address`, `balance`, and `balance.json`
+  leaves under `/wallets/<wallet>/0/chains/<solana-chain>/`.
+
+Each session records the selected wallet's account-0 address and checks it before
+subsequent operations. Before confirmation or inspection, the Petal verifies the
+sender and deposit bytes in the session's exact outbox entry. Bloom handles
+Broker authorization, simulation, policy, signing, and broadcast through its
+canonical transaction host interfaces.
+
+After an ambiguous confirmation, retry `confirm` or `refresh` to inspect the same
+outbox entry. The Petal never automatically rebroadcasts it. If inspection remains
+pending without a hash, use Bloom's reconciliation and approval surfaces; do not
+create another swap to work around the ambiguity.

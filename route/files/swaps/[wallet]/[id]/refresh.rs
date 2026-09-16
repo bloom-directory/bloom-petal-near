@@ -1,5 +1,5 @@
 petal::route_file!(
-    spec: petal::write_spec().caps(&["bloom:http", "bloom:store", "bloom:tx.outbox"]),
+    spec: petal::write_spec().caps(&["bloom:http", "bloom:store", "bloom:tx.outbox", "bloom:vfs.read"]),
     read: |_ctx: &petal::Ctx| {
         petal::DispatchResponse::Read(
             b"write refresh to inspect outbox; 1Click is polled only after an origin tx hash exists\n"
@@ -7,7 +7,7 @@ petal::route_file!(
         )
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
-        let wallet = match petal::param(ctx, "wallet") {
+        let wallet = match petal::wallet_param(ctx) {
             Ok(value) => value,
             Err(response) => return response,
         };

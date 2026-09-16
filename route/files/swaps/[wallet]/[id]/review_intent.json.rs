@@ -1,5 +1,5 @@
 petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
-    let wallet = match petal::param(ctx, "wallet") {
+    let wallet = match petal::wallet_param(ctx) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -13,6 +13,7 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
             "prepared_artifact_digest": session.prepared_digest,
             "wallet": session.wallet,
             "wallet_address": session.wallet_address,
+            "account": session.account,
             "origin": session.origin,
             "quote_hash": session.quote_hash,
             "transaction": session.prepared_transaction,
@@ -20,6 +21,7 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
             "recipient": session.quote.quote_request.recipient,
             "minimum_output": session.quote.quote.min_amount_out,
             "refund_to": session.quote.quote_request.refund_to,
+            "app_fees": session.quote.quote_request.app_fees,
         })),
         Err(error) => petal::error(-1, error),
     }

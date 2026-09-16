@@ -35,6 +35,8 @@ pub struct Session {
     pub id: String,
     pub wallet: String,
     pub wallet_address: String,
+    #[serde(default)]
+    pub account: Option<crate::accounts::AccountBinding>,
     pub created_ms: u64,
     pub updated_ms: u64,
     pub state: String,

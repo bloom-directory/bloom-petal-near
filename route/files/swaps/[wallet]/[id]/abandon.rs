@@ -1,12 +1,12 @@
 petal::route_file!(
-    spec: petal::write_spec().caps(&["bloom:store"]),
+    spec: petal::write_spec().caps(&["bloom:store", "bloom:vfs.read"]),
     read: |_ctx: &petal::Ctx| {
         petal::DispatchResponse::Read(
             b"write abandon before any outbox transaction exists\n".to_vec(),
         )
     },
     write: |ctx: &petal::Ctx, _body: &[u8]| {
-        let wallet = match petal::param(ctx, "wallet") {
+        let wallet = match petal::wallet_param(ctx) {
             Ok(value) => value,
             Err(response) => return response,
         };

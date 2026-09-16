@@ -26,3 +26,17 @@ Never run a live-money swap without explicit user authorization.
 - After changing route or domain code, run
   `scripts/check-route-architecture.sh`, route tests and Clippy,
   `scripts/build.sh`, and `petal check --root .`.
+
+## Wallets and transactions
+
+- The package is wallet-scoped and supports account 0. Resolve wallet route
+  parameters with the canonical `petal::wallet_param(ctx)` helper.
+- Read EVM identity from `wallets/<wallet>/0/address.evm`. Chain leaves and outbox
+  artifacts are under `wallets/<wallet>/0/chains/<chain>/`; Solana address/balance
+  leaves are direct children of that directory.
+- Preserve the session's account-0 address binding and verify the sender and
+  prepared deposit against its exact outbox entry before confirmation or inspection.
+- Never construct reserved `bloom.*` parameters. Keep transaction writes on the
+  canonical SDK host imports and preserve Broker-mediated authorization.
+- Persist ambiguity markers before staging and confirmation. Reconcile ambiguous
+  broadcasts through the existing outbox entry without automatically rebroadcasting.

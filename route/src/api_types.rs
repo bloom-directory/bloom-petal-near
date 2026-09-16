@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 pub struct AppFee {
     pub recipient: String,
     pub fee: u32,
+    /// Opaque upstream association for a normalized fee created for a limit order.
+    ///
+    /// This is response-only metadata. The executable quote policy continues to
+    /// reject every non-empty `appFees` list before any deposit can be staged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_order_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -247,6 +253,28 @@ mod tests {
             from_slice_no_duplicates::<serde_json::Value>(input)
                 .unwrap_err()
                 .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn quote_app_fee_accepts_upstream_limit_order_association_but_remains_strict() {
+        let fee: AppFee = from_slice_no_duplicates(
+            br#"{"recipient":"1click.near","fee":10,"limitOrderId":"order_01JQ7YJ9Q5"}"#,
+        )
+        .unwrap();
+        assert_eq!(fee.limit_order_id.as_deref(), Some("order_01JQ7YJ9Q5"));
+
+        assert!(
+            from_slice_no_duplicates::<AppFee>(
+                br#"{"recipient":"1click.near","fee":10,"limitOrderId":"a","limitOrderId":"b"}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            from_slice_no_duplicates::<AppFee>(
+                br#"{"recipient":"1click.near","fee":10,"unreviewed":true}"#,
+            )
+            .is_err()
         );
     }
 
