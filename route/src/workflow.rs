@@ -127,7 +127,6 @@ fn validate_echo(
         || r.custom_recipient_msg.is_some()
         || r.referral.is_some()
         || r.rebates.as_ref().is_some_and(|v| !v.is_empty())
-        || r.app_fees.as_ref().is_some_and(|v| !v.is_empty())
         || !matches!(r.confidentiality.as_deref(), None | Some("public"))
         || q.chain_deposit_addresses
             .as_ref()
@@ -137,6 +136,9 @@ fn validate_echo(
         || q.custom_recipient_msg.is_some()
     {
         return Err("quote contains unsupported execution metadata".into());
+    }
+    if r.app_fees.as_ref().is_some_and(|v| !v.is_empty()) {
+        return Err("quote contains unsupported upstream appFees".into());
     }
     if r.swap_type != sent.swap_type
         || r.slippage_tolerance != sent.slippage_tolerance
@@ -338,6 +340,9 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
     };
     let result: Result<String, String> = (|| {
         let (quote, raw) = api::quote(host, &jwt, &sent)?;
+        // Retain bounded, private evidence before validation so a signed quote
+        // rejected by policy can be reviewed without rerunning it.
+        host.put(&format!("swaps/{wallet}/{id}/quote.raw.json"), &raw, false)?;
         let hash = verifier(&quote)?;
         validate_echo(&sent, &quote, &wallet_address, now)?;
         preflight(
@@ -347,7 +352,6 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
             &wallet_address,
             &quote.quote.amount_in,
         )?;
-        host.put(&format!("swaps/{wallet}/{id}/quote.raw.json"), &raw, false)?;
         let mut s = Session {
             schema_version: 2,
             id: id.clone(),
@@ -1226,12 +1230,17 @@ mod workflow_tests {
             test_verify,
         )
         .unwrap_err();
-        assert!(error.contains("unsupported execution metadata"));
+        assert!(error.contains("unsupported upstream appFees"));
         let shared = shared.borrow();
         assert_eq!(shared.quote_calls, 1);
         assert_eq!(shared.stage_calls, 0);
         assert_eq!(shared.confirm_calls, 0);
         assert_eq!(shared.submit_calls, 0);
+        assert!(
+            shared
+                .store
+                .contains_key("swaps/alice/test-limit-order-fee/quote.raw.json")
+        );
     }
 
     #[test]
