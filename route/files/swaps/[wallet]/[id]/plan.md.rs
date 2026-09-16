@@ -29,7 +29,13 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         .app_fees
         .as_deref()
         .and_then(|fees| fees.first())
-        .map(|fee| format!("{} bps to `{}`", fee.fee, fee.recipient))
+        .map(|fee| {
+            format!(
+                "{} bps to `{}`",
+                fee.fee,
+                fee.recipient.replace('\\', "\\\\").replace('`', "\\`")
+            )
+        })
         .unwrap_or_else(|| "none".into());
     petal::DispatchResponse::Read(
         format!(

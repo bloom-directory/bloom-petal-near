@@ -12,6 +12,7 @@ use petal::sdk::EvmTransaction;
 use sha2::{Digest, Sha256};
 
 const MAX_UPSTREAM_APP_FEE_BPS: u32 = 40;
+const MAX_UPSTREAM_APP_FEE_RECIPIENT_BYTES: usize = 64;
 
 fn json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
     serde_json::to_vec(value).map_err(|e| e.to_string())
@@ -112,11 +113,18 @@ fn allowed_upstream_app_fees(fees: Option<&Vec<crate::api_types::AppFee>>) -> bo
         Some(fees) => matches!(
             fees.as_slice(),
             [fee]
-                if !fee.recipient.trim().is_empty()
+                if valid_upstream_app_fee_recipient(&fee.recipient)
                     && fee.fee <= MAX_UPSTREAM_APP_FEE_BPS
                     && fee.limit_order_id.is_none()
         ),
     }
+}
+
+fn valid_upstream_app_fee_recipient(recipient: &str) -> bool {
+    (2..=MAX_UPSTREAM_APP_FEE_RECIPIENT_BYTES).contains(&recipient.len())
+        && recipient.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+        })
 }
 
 fn validate_echo(
@@ -1279,6 +1287,22 @@ mod workflow_tests {
             fee(20, None),
             fee(20, None)
         ])));
+    }
+
+    #[test]
+    fn upstream_fee_policy_rejects_unrenderable_recipients() {
+        let fee = |recipient: String| crate::api_types::AppFee {
+            recipient,
+            fee: 20,
+            limit_order_id: None,
+        };
+        assert!(allowed_upstream_app_fees(Some(&vec![fee(
+            "protocol-fee.near".into()
+        )])));
+        assert!(!allowed_upstream_app_fees(Some(&vec![fee(
+            "x`\n- forged: field".into()
+        )])));
+        assert!(!allowed_upstream_app_fees(Some(&vec![fee("x".repeat(65))])));
     }
 
     #[test]
