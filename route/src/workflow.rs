@@ -795,6 +795,7 @@ mod workflow_tests {
         stage_fails: bool,
         corrupt_signature: bool,
         response_insured: Option<bool>,
+        response_app_fees: Option<Vec<crate::api_types::AppFee>>,
         inspect_pending: bool,
         malformed_status: bool,
         inspect_denied: bool,
@@ -892,6 +893,7 @@ mod workflow_tests {
                     let request: QuoteRequest = serde_json::from_value(request_json).unwrap();
                     let mut quote = signed_quote(request);
                     quote.quote_request.insured = self.0.borrow().response_insured;
+                    quote.quote_request.app_fees = self.0.borrow().response_app_fees.clone();
                     if self.0.borrow().corrupt_signature {
                         quote.signature = "ed25519:1".into();
                     }
@@ -1201,6 +1203,35 @@ mod workflow_tests {
                 assert!(error.contains("unsupported execution metadata"));
             }
         }
+    }
+
+    #[test]
+    fn parsed_limit_order_fee_is_verified_but_cannot_authorize_a_deposit() {
+        let shared = Rc::new(RefCell::new(Shared {
+            response_app_fees: Some(vec![crate::api_types::AppFee {
+                recipient: "1click.near".into(),
+                fee: 10,
+                limit_order_id: Some("order_01JQ7YJ9Q5".into()),
+            }]),
+            ..Shared::default()
+        }));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let request = serde_json::json!({"session_id":"test-limit-order-fee","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":"recipient-on-destination","deadline_seconds":900});
+
+        let error = create_with_verifier(
+            &mut host,
+            "alice",
+            &serde_json::to_vec(&request).unwrap(),
+            test_verify,
+        )
+        .unwrap_err();
+        assert!(error.contains("unsupported execution metadata"));
+        let shared = shared.borrow();
+        assert_eq!(shared.quote_calls, 1);
+        assert_eq!(shared.stage_calls, 0);
+        assert_eq!(shared.confirm_calls, 0);
+        assert_eq!(shared.submit_calls, 0);
     }
 
     #[test]
