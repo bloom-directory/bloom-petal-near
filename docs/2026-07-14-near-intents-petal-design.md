@@ -153,6 +153,11 @@ The Petal omits `appFees`, `rebates`, `insured`, `confidentiality`,
 The live API may echo an omitted `insured` request field as `false`. The Petal
 accepts absent or `false` because `insured` is excluded from the official SDK's
 signed projection, but rejects `true` as unsupported execution metadata.
+The live API may also add one unassociated protocol `appFees` entry. The Petal
+accepts it only when its recipient is nonempty, `limitOrderId` is absent or
+null, and its fee is at most 40 bps. It rejects multiple fees, associated limit
+order fees, and any fee above that cap; accepted fees are shown in the quote and
+review material.
 The unknown-field policy in section 4.3 controls schema evolution; retaining
 raw response evidence does not make an unknown field acceptable for execution.
 
@@ -622,6 +627,7 @@ Before staging, `plan.md` must clearly show:
 - destination asset, recipient, quoted output, minimum output, and estimated
   execution time;
 - slippage, refund address, refund fee, withdrawal fee, and deadlines;
+- any accepted upstream application fee, including recipient and basis points;
 - signed deposit address and quote verification status;
 - quote correlation ID and local quote digest;
 - the exact EVM `to`, value, and decoded operation;

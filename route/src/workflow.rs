@@ -11,6 +11,8 @@ use crate::{
 use petal::sdk::EvmTransaction;
 use sha2::{Digest, Sha256};
 
+const MAX_UPSTREAM_APP_FEE_BPS: u32 = 40;
+
 fn json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
     serde_json::to_vec(value).map_err(|e| e.to_string())
 }
@@ -103,6 +105,20 @@ fn parse_time_ms(value: &str) -> Result<u64, String> {
         .map_err(|_| "quote deadline predates epoch".into())
 }
 
+fn allowed_upstream_app_fees(fees: Option<&Vec<crate::api_types::AppFee>>) -> bool {
+    match fees {
+        None => true,
+        Some(fees) if fees.is_empty() => true,
+        Some(fees) => matches!(
+            fees.as_slice(),
+            [fee]
+                if !fee.recipient.trim().is_empty()
+                    && fee.fee <= MAX_UPSTREAM_APP_FEE_BPS
+                    && fee.limit_order_id.is_none()
+        ),
+    }
+}
+
 fn validate_echo(
     sent: &QuoteRequest,
     got: &QuoteResponse,
@@ -127,7 +143,6 @@ fn validate_echo(
         || r.custom_recipient_msg.is_some()
         || r.referral.is_some()
         || r.rebates.as_ref().is_some_and(|v| !v.is_empty())
-        || r.app_fees.as_ref().is_some_and(|v| !v.is_empty())
         || !matches!(r.confidentiality.as_deref(), None | Some("public"))
         || q.chain_deposit_addresses
             .as_ref()
@@ -137,6 +152,11 @@ fn validate_echo(
         || q.custom_recipient_msg.is_some()
     {
         return Err("quote contains unsupported execution metadata".into());
+    }
+    if !allowed_upstream_app_fees(r.app_fees.as_ref()) {
+        return Err(format!(
+            "quote appFees exceed policy (one unassociated fee at most {MAX_UPSTREAM_APP_FEE_BPS} bps)"
+        ));
     }
     if r.swap_type != sent.swap_type
         || r.slippage_tolerance != sent.slippage_tolerance
@@ -338,6 +358,9 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
     };
     let result: Result<String, String> = (|| {
         let (quote, raw) = api::quote(host, &jwt, &sent)?;
+        // Retain bounded, private evidence before validation so a signed quote
+        // rejected by policy can be reviewed without rerunning it.
+        host.put(&format!("swaps/{wallet}/{id}/quote.raw.json"), &raw, false)?;
         let hash = verifier(&quote)?;
         validate_echo(&sent, &quote, &wallet_address, now)?;
         preflight(
@@ -347,7 +370,6 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
             &wallet_address,
             &quote.quote.amount_in,
         )?;
-        host.put(&format!("swaps/{wallet}/{id}/quote.raw.json"), &raw, false)?;
         let mut s = Session {
             schema_version: 2,
             id: id.clone(),
@@ -795,6 +817,7 @@ mod workflow_tests {
         stage_fails: bool,
         corrupt_signature: bool,
         response_insured: Option<bool>,
+        response_app_fees: Option<Vec<crate::api_types::AppFee>>,
         inspect_pending: bool,
         malformed_status: bool,
         inspect_denied: bool,
@@ -892,6 +915,7 @@ mod workflow_tests {
                     let request: QuoteRequest = serde_json::from_value(request_json).unwrap();
                     let mut quote = signed_quote(request);
                     quote.quote_request.insured = self.0.borrow().response_insured;
+                    quote.quote_request.app_fees = self.0.borrow().response_app_fees.clone();
                     if self.0.borrow().corrupt_signature {
                         quote.signature = "ed25519:1".into();
                     }
@@ -1201,6 +1225,60 @@ mod workflow_tests {
                 assert!(error.contains("unsupported execution metadata"));
             }
         }
+    }
+
+    #[test]
+    fn bounded_unassociated_upstream_fee_is_verified_and_quoted_without_staging() {
+        let shared = Rc::new(RefCell::new(Shared {
+            response_app_fees: Some(vec![crate::api_types::AppFee {
+                recipient: "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd"
+                    .into(),
+                fee: 20,
+                limit_order_id: None,
+            }]),
+            ..Shared::default()
+        }));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let request = serde_json::json!({"session_id":"test-limit-order-fee","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":"recipient-on-destination","deadline_seconds":900});
+
+        let id = create_with_verifier(
+            &mut host,
+            "alice",
+            &serde_json::to_vec(&request).unwrap(),
+            test_verify,
+        )
+        .unwrap();
+        assert_eq!(load(&mut host, "alice", &id).unwrap().state, "quoted");
+        let shared = shared.borrow();
+        assert_eq!(shared.quote_calls, 1);
+        assert_eq!(shared.stage_calls, 0);
+        assert_eq!(shared.confirm_calls, 0);
+        assert_eq!(shared.submit_calls, 0);
+        assert!(
+            shared
+                .store
+                .contains_key("swaps/alice/test-limit-order-fee/quote.raw.json")
+        );
+    }
+
+    #[test]
+    fn upstream_fee_policy_rejects_limit_order_multiple_and_over_cap_fees() {
+        let fee = |bps, limit_order_id| crate::api_types::AppFee {
+            recipient: "upstream-recipient".into(),
+            fee: bps,
+            limit_order_id,
+        };
+        assert!(allowed_upstream_app_fees(Some(&vec![fee(40, None)])));
+        assert!(!allowed_upstream_app_fees(Some(&vec![fee(41, None)])));
+        assert!(!allowed_upstream_app_fees(Some(&vec![fee(
+            20,
+            Some("limit-order".into()),
+        )])));
+        assert!(!allowed_upstream_app_fees(Some(&vec![
+            fee(20, None),
+            fee(20, None)
+        ])));
     }
 
     #[test]

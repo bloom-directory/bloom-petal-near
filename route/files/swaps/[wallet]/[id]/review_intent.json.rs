@@ -21,6 +21,7 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
             "recipient": session.quote.quote_request.recipient,
             "minimum_output": session.quote.quote.min_amount_out,
             "refund_to": session.quote.quote_request.refund_to,
+            "app_fees": session.quote.quote_request.app_fees,
         })),
         Err(error) => petal::error(-1, error),
     }
