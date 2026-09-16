@@ -54,44 +54,37 @@ references immutable and update them together when changing release machinery.
 
 ## Bloom v0.3 account contract
 
-This migration targets the v0.3.0 release candidate in
-[Bloom #284](https://github.com/bloom-directory/bloom/pull/284), commit
-`e8d8eb331511d81d50ca0ab5308a8e0aa27f067a`. Execution is currently blocked:
-its `/petals/near-intents` mount supplies no trusted account context. The Petal
-refuses to quote, prepare, stage, confirm, or refresh an executable swap without
-that context. `[account] aware = true` declares support; it does not create a
-host dispatch mechanism. Settings, token discovery, and saved-session reads
-remain available.
+This migration follows [Enso #7](https://github.com/bloom-directory/bloom-petal-enso/pull/7):
+NEAR Intents remains wallet-scoped and supports **account 0 only** within the
+wallet selected by the route. There is no account-awareness manifest declaration,
+account selector in requests, or requirement for trusted account-dispatch fields.
+Multi-account support is deferred.
 
-New requests require `account_fingerprint` and `derivation_path`. Copy the
-intended active EVM account's `public_key_fingerprint` and `path` from
-`/wallets/<wallet>/accounts.json`. The Petal resolves and verifies its `number`
-from that exact pair, cross-checks the host account context, and persists the
-binding. It never chooses an account by array order or defaults to account 0.
-Every wallet route uses the SDK's `wallet_param` helper.
+Every wallet route uses the SDK's `wallet_param` helper. Current public paths:
 
-Current public paths:
+- EVM address: `/wallets/<wallet>/0/address.evm`.
+- EVM native balance: `/wallets/<wallet>/0/chains/<chain>/balance.raw`.
+- Outbox staging: `/wallets/<wallet>/0/chains/<chain>/outbox/new.tx`.
+- Outbox entries: `/wallets/<wallet>/0/chains/<chain>/outbox/<pending|sent|failed>/<id>/`.
+- Solana recipient discovery: direct `address`, `balance`, and `balance.json`
+  leaves under `/wallets/<wallet>/0/chains/<solana-chain>/`.
+  Solana origins remain unsupported.
 
-- EVM address: `/wallets/<wallet>/<n>/address.evm`.
-- EVM native balance: `/wallets/<wallet>/<n>/chains/<chain>/balance.raw`.
-- Outbox staging: `/wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`.
-- Outbox entries: `/wallets/<wallet>/<n>/chains/<chain>/outbox/<pending|sent|failed>/<id>/`.
-- Solana recipient address and balances: direct `address`, `balance`, and
-  `balance.json` leaves under `/wallets/<wallet>/<n>/chains/<solana-chain>/`.
-  Resolve the Solana account using its fingerprint and `m/44'/501'/<n>'/0'`
-  path in `accounts.json`. Solana origins remain unsupported.
+The account-0 address is persisted with each new session and checked before
+subsequent operations. Missing account-0 addresses never fall back to wallet-root
+addresses. Nonzero session bindings and account-selector request fields are
+rejected. Older sessions without an account binding remain readable but require
+manual recovery before execution.
 
-The Petal uses canonical `tx_stage`, `tx_confirm`, and `tx_inspect` host imports;
-these receive wallet and chain names, not VFS paths. Bloom must supply their
-trusted account context. The Petal also verifies `intent.json` through the
-numbered account outbox before confirmation or inspection. Broker authorization,
-Bloom simulation, policy, and signing remain host responsibilities.
+The Petal retains canonical `tx_stage`, `tx_confirm`, and `tx_inspect` host imports
+with wallet and chain names. Bloom selects the wallet's account 0 and retains
+Broker authorization, simulation, policy, and signing. Before confirmation or
+inspection, the Petal verifies the sender and deposit bytes in the exact account-0
+outbox entry. No reserved `bloom.*` context fields are fabricated.
 
-After an ambiguous confirmation, retry `confirm` or `refresh` to inspect the
-same outbox entry. The Petal never automatically rebroadcasts it. If inspection
-remains pending without a transaction hash, use Bloom's reconciliation and
-approval surfaces; do not create another swap to work around the ambiguity.
-Legacy sessions without an exact account binding remain readable but require
-manual recovery; they are never assigned account 0.
+After an ambiguous confirmation, retry `confirm` or `refresh` to inspect the same
+outbox entry. The Petal never automatically rebroadcasts it. If inspection remains
+pending without a hash, use Bloom's reconciliation and approval surfaces; do not
+create another swap to work around the ambiguity.
 
-See [the migration contract and Bloom blocker](docs/bloom-v0.3-migration.md).
+See [the migration contract and validation](docs/bloom-v0.3-migration.md).

@@ -14,10 +14,6 @@ fn default_wait() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct NewSwapRequest {
     pub session_id: String,
-    #[serde(default)]
-    pub account_fingerprint: String,
-    #[serde(default)]
-    pub derivation_path: String,
     pub swap_type: String,
     pub origin_asset: String,
     pub destination_asset: String,
@@ -46,9 +42,6 @@ fn safe(value: &str, max: usize) -> bool {
 
 impl NewSwapRequest {
     pub fn validate(&self) -> Result<(), String> {
-        if self.account_fingerprint.is_empty() || self.derivation_path.is_empty() {
-            return Err("account_fingerprint and derivation_path are required".into());
-        }
         if !(8..=64).contains(&self.session_id.len())
             || !self
                 .session_id
@@ -108,8 +101,6 @@ mod tests {
     fn session_ids_are_caller_known_safe_segments() {
         let valid = NewSwapRequest {
             session_id: "agent-20260714-0001".into(),
-            account_fingerprint: "aa".repeat(32),
-            derivation_path: "m/44'/60'/0'/0/7".into(),
             swap_type: "EXACT_INPUT".into(),
             origin_asset: "origin".into(),
             destination_asset: "destination".into(),

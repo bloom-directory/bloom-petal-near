@@ -29,12 +29,12 @@ Never run a live-money swap without explicit user authorization.
 
 ## Bloom v0.3 account contract
 
-- Follow `docs/bloom-v0.3-migration.md` for the release-candidate contract and
-  the Bloom-owned trusted-dispatch blocker.
-- Resolve account numbers from the intended fingerprint and derivation path in
-  `wallets/<wallet>/accounts.json`. Never select by list position or default to 0.
-- Chain leaves and outbox artifacts are under
-  `wallets/<wallet>/<n>/chains/<chain>/`; Solana address/balance leaves are direct
-  children of that directory. EVM addresses are `<n>/address.evm`.
-- Consume host-injected account context only. Never construct reserved `bloom.*`
-  parameters. Keep transaction writes on the canonical SDK host imports.
+- Follow `docs/bloom-v0.3-migration.md` and the Enso wallet-scoped pattern.
+- Support only account 0 within the route's selected wallet. Do not declare
+  account awareness or add fingerprint/path selectors; multi-account support
+  is deferred.
+- Read EVM identity from `wallets/<wallet>/0/address.evm`. Chain leaves and outbox
+  artifacts are under `wallets/<wallet>/0/chains/<chain>/`; Solana address/balance
+  leaves are direct children of that directory.
+- Never construct reserved `bloom.*` parameters. Keep transaction writes on the
+  canonical SDK host imports and preserve Broker-mediated authorization.

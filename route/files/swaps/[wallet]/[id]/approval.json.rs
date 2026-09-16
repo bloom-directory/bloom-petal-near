@@ -7,7 +7,7 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         Ok(value) => value,
         Err(response) => return response,
     };
-    let mut host = crate::workflow::BloomHost::default();
+    let mut host = crate::workflow::BloomHost;
     match crate::workflow::load(&mut host, wallet, id) {
         Ok(session) => session
             .approval

@@ -14,7 +14,7 @@ petal::route_file!(
             Ok(value) => value,
             Err(response) => return response,
         };
-        let mut host = crate::workflow::BloomHost::new(ctx);
+        let mut host = crate::workflow::BloomHost;
         match crate::workflow::abandon(&mut host, wallet, id) {
             Ok(()) => petal::DispatchResponse::Write,
             Err(error) => petal::error(-4, crate::redaction::sanitize_message(&error)),

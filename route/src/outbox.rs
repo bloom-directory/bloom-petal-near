@@ -16,6 +16,9 @@ struct Intent {
 
 pub fn verify_owned<H: Host>(host: &mut H, session: &Session) -> Result<(), String> {
     let account = session.account.as_ref().ok_or("account binding missing")?;
+    if account.number != 0 {
+        return Err("only account 0 is supported".into());
+    }
     let id = session.outbox_id.as_deref().ok_or("outbox ID missing")?;
     if id.is_empty()
         || id.len() > 128

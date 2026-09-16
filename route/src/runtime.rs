@@ -1,9 +1,6 @@
 use petal::sdk::{EvmTransaction, HttpRequest, HttpResponse, OutboxInspection, StagedTransaction};
 
 pub trait Host {
-    fn trusted_account(&self) -> Option<crate::accounts::TrustedAccount> {
-        None
-    }
     fn now_ms(&mut self) -> u64;
     fn random(&mut self, len: usize) -> Result<Vec<u8>, String>;
     fn setting(&mut self, key: &str) -> Result<Option<String>, String>;
@@ -32,22 +29,9 @@ pub trait Host {
     ) -> Result<OutboxInspection, String>;
 }
 
-#[derive(Default)]
-pub struct BloomHost {
-    account: Option<crate::accounts::TrustedAccount>,
-}
-impl BloomHost {
-    pub fn new(ctx: &petal::Ctx) -> Self {
-        Self {
-            account: crate::accounts::TrustedAccount::from_params(&ctx.params),
-        }
-    }
-}
+pub struct BloomHost;
 
 impl Host for BloomHost {
-    fn trusted_account(&self) -> Option<crate::accounts::TrustedAccount> {
-        self.account.clone()
-    }
     fn now_ms(&mut self) -> u64 {
         petal::sdk::now_ms()
     }

@@ -1,5 +1,5 @@
 petal::route_file!(spec: petal::store_read_spec(), read: |_ctx: &petal::Ctx| {
-    let mut host = crate::workflow::BloomHost::default();
+    let mut host = crate::workflow::BloomHost;
     match crate::workflow::credential_status(&mut host) {
         Ok(credential) => petal::read_json_value(&serde_json::json!({
             "credential": credential,

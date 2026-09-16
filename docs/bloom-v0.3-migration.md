@@ -1,86 +1,63 @@
 # Bloom v0.3 migration
 
-## Target and references
+## Target and reference
 
-Contract inspected: Bloom release PR #284 at
+The implementation follows [Enso #7](https://github.com/bloom-directory/bloom-petal-enso/pull/7)
+at `cd9031ad0b2b516c6a514b575204752bbfc163e5`: wallet-scoped routes select the
+wallet with `petal::wallet_param(ctx)` and read its canonical account-0 EVM address.
+The package does not declare account awareness. Multi-account support is deferred.
+
+Tested Bloom source: release PR #284 at
 `e8d8eb331511d81d50ca0ab5308a8e0aa27f067a` (workspace version 0.3.0).
-At inspection time this was an open release candidate, not a released v0.3.0 tag.
+This was an open release candidate at inspection time.
 
-Reference migrations:
-[Tolly #1](https://github.com/josh-richardson/bloom-petal-tolly/pull/1) at
-`389c736dd10cc32f3b3939239639d7152dc74f00` and
-[Enso #7](https://github.com/bloom-directory/bloom-petal-enso/pull/7) at
-`cd9031ad0b2b516c6a514b575204752bbfc163e5`.
-Those migrations explicitly use account 0. This package instead requires the
-intended fingerprint and derivation path, as required for exact account binding.
+## Supported behavior
 
-## Contract changes
+The selected wallet's EVM address is `wallets/<wallet>/0/address.evm`; its native
+balance is `wallets/<wallet>/0/chains/<chain>/balance.raw`. Outbox artifacts live
+beneath that chain directory. Contract reads and chain-ID checks continue through
+the canonical mediated chain RPC import, with the persisted account-0 address
+in ERC-20 balance calls. Solana recipient discovery uses direct `address`,
+`balance`, and `balance.json` leaves beneath `wallets/<wallet>/0/chains/<chain>/`;
+there is no additional `solana/` directory. Solana-origin execution is unsupported.
 
-The public inventory is `wallets/<wallet>/accounts.json`: `wallet_id`, `accounts`,
-and optional `accounts_unavailable`. Each row's `public_key_fingerprint`, `path`,
-`derivation_profile`, `lifecycle`, and `number` identify the selectable account.
-For EVM, `m/44'/60'/0'/0/<n>` encodes the number. Resolve a unique active matching
-row and require its declared number to agree with its canonical path. Missing,
-retired, ambiguous, malformed, unavailable, or mismatched identities fail closed.
+Requests retain their original wallet-scoped shape. They do not accept an account
+number, fingerprint or derivation path. Account 0 is the explicit supported
+contract, not a fallback after another selection fails. No inventory list position
+is used, and missing account-0 identity never falls back to a wallet-root address.
 
-The EVM address is `wallets/<wallet>/<n>/address.evm`; native balance is
-`wallets/<wallet>/<n>/chains/<chain>/balance.raw`. Contract reads and chain-ID
-checks continue through the canonical mediated chain RPC import, with the exact
-bound EVM address in ERC-20 balance calls. Outbox artifacts live beneath the
-same numbered chain directory. Direct Solana `address`, `balance`, and
-`balance.json` leaves live beneath its numbered chain directory, with no nested
-`solana/` component. This package does not add Solana-origin execution.
+New session schema 2 records account number 0 and the selected wallet's address.
+The prepared digest and public review include that binding. Before side effects,
+reject nonzero bindings and require the current account-0 address to match the
+persisted address. Legacy unbound sessions remain readable but need manual recovery.
+Before confirmation or inspection, read the exact account-0 outbox intent and
+compare sender, wallet, chain, chain ID, outbox ID and prepared deposit bytes.
+Never resolve a session's outbox through `latest`.
 
-Session schema 2 persists the account number, fingerprint and path; the prepared
-artifact digest and public review include them. Revalidate against current
-inventory and host context before side effects. Prior sessions remain readable
-but cannot execute without a binding. Confirm/inspect also open the exact
-account-scoped outbox intent and compare sender, wallet, chain, chain ID,
-outbox ID and prepared deposit bytes. Never resolve an outbox via `latest`.
+Typed SDK outbox imports are retained, with wallet and chain arguments. Bloom's
+wallet-scoped host selects account 0 and owns Broker authorization, simulation,
+policy and signing. No guest VFS write or direct RPC broadcast replaces those
+checks. The root Petal mount does not need account-scoped dispatch for this
+wallet-scoped contract, and the guest neither reads nor fabricates reserved
+`bloom.*` account parameters. A future multi-account feature will need a supported
+host dispatch contract; it is outside this migration.
 
-Typed SDK outbox imports are retained. No guest VFS write or direct RPC broadcast
-replaces Broker authorization. A durable pending marker precedes confirmation;
-timeouts, traps and failed persistence after that boundary require inspection,
-including after quote expiry. A returned approval requirement permits retrying
-the same outbox only after the host's authorization flow. Staging ambiguity still
-requires manual recovery and never restages automatically.
+A durable pending marker precedes confirmation. Timeouts, traps and failed
+persistence after that boundary require inspection, including after quote expiry.
+A returned approval requirement permits retrying the same outbox through the
+host's authorization flow. Staging ambiguity requires manual recovery and never
+restages automatically.
 
-## Blocking Bloom-owned change
+## Coverage and limits
 
-The release candidate's
-[`PetalRouter::dispatch_petal`](https://github.com/bloom-directory/bloom/blob/e8d8eb331511d81d50ca0ab5308a8e0aa27f067a/crates/bloom-petals/src/router.rs)
-dispatches the root `/petals` mount with no account parameters or account wallet.
-`dispatch_for_account` exists internally, but its `for_account` documentation
-explicitly says no VFS mount uses it. The
-[runner](https://github.com/bloom-directory/bloom/blob/e8d8eb331511d81d50ca0ab5308a8e0aa27f067a/crates/bloom-petals/src/runner.rs)
-rejects caller context beginning with `bloom.` and injects the owner fingerprint
-only for a trusted account dispatch. Route `[wallet]` parameters and JSON input
-are not trusted account context.
-
-**Owner: Bloom (`bloom-petals` router/runner, daemon account/outbox host).** Supply
-a supported account-selecting entry point for `/petals/<mount>` that resolves the
-Broker account, enforces account-aware package eligibility, and injects trusted
-wallet, number and owner fingerprint. Route the same context into stage,
-confirmation, inspection and Broker authorization. The daemon's confirmation
-and inspection handlers currently check package origin but do not independently
-compare the requested account with the staged sender; add that host-side fence
-and mismatch tests as part of the change. The guest's numbered intent read is
-additional protection, not a substitute for the host enforcement boundary.
-
-This PR consumes host-injected context only. It never writes reserved `bloom.*`
-fields and offers no context override setting. Root-mounted execution remains
-blocked, including for account 0. Do not advertise complete v0.3 swap support
-until the Bloom dispatch change has been integrated and tested.
-
-## Validation scope
-
-Unit/workflow fixtures exercise sparse/reordered inventories, mismatch rejection,
-nonzero account address and balance paths, native/ERC-20 staging, approval retries,
-outbox ownership, restart, ambiguous broadcast reconciliation, and settlement
-submission. These use mocked host imports and do not prove real Broker approval
-or RPC simulation. Actual account-scoped staging, simulation, authorization and
-submission must be exercised after the Bloom dispatch blocker is resolved.
-No live-money swap is authorized or performed by this migration.
+Fixtures exercise account 0 without trusted context or selector inputs, multiple
+wallet route values, rejection of nonzero sessions, missing canonical addresses,
+changed sender addresses, native/ERC-20 staging, Broker approval retries, exact
+outbox ownership, moved entries, restart, ambiguous broadcast reconciliation and
+settlement submission. These use mocked host imports, so actual RPC simulation
+and Broker approval are not claimed as end-to-end tested. The isolated real-Bloom
+smoke test validates package installation, route execution and durable settings.
+No live-money swap was authorized or performed.
 
 ## Validation results (2026-09-16)
 
@@ -102,7 +79,7 @@ No live-money swap is authorized or performed by this migration.
 
 | Check | Result |
 | --- | --- |
-| `cargo test --manifest-path route/Cargo.toml --locked` | 42 passed |
+| `cargo test --manifest-path route/Cargo.toml --locked` | 41 passed |
 | `cargo clippy --manifest-path route/Cargo.toml --locked --all-targets -- -D warnings` | Passed |
 | `cargo fmt --manifest-path route/Cargo.toml --all -- --check` | Passed |
 | `scripts/check-route-architecture.sh` | 24 controllers passed |
