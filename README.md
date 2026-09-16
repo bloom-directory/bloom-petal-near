@@ -32,15 +32,14 @@ authorization and a deliberately funded low-value wallet.
 
 ## Releases
 
-Installable Petal packages are built and published by this repository. The
-first release is `v0.1.0`; later releases use immutable SemVer tags. Create the
-tag from a reviewed commit on `master` and push it to GitHub. The tag workflow
-calls the canonical reusable release workflow from
+Installable Petal packages are built and published by this repository using
+immutable SemVer tags. Create a tag from a reviewed commit on `master` and push
+it to GitHub. The tag workflow calls the canonical reusable release workflow from
 [`bloom-directory/petal`](https://github.com/bloom-directory/petal), which
 builds and validates the package before attaching these files to the GitHub
 release:
 
-- `near-intents-v0.1.0.petal.tar.gz`
+- `near-intents-v<version>.petal.tar.gz`
 - `SHA256SUMS`
 - `petal-release.json`
 
@@ -52,15 +51,12 @@ The two references in `.github/workflows/release.yml` pin the same full commit
 SHA containing the canonical reusable workflow and Petal tooling. Keep both
 references immutable and update them together when changing release machinery.
 
-## Bloom v0.3 account contract
+## Wallets and transactions
 
-This migration follows [Enso #7](https://github.com/bloom-directory/bloom-petal-enso/pull/7):
-NEAR Intents remains wallet-scoped and supports **account 0 only** within the
-wallet selected by the route. There is no account-awareness manifest declaration,
-account selector in requests, or requirement for trusted account-dispatch fields.
-Multi-account support is deferred.
+Swaps use **account 0** of the wallet selected by the route. Supported origins
+are EVM chains; Solana addresses can be used as destination recipients.
 
-Every wallet route uses the SDK's `wallet_param` helper. Current public paths:
+Wallet paths:
 
 - EVM address: `/wallets/<wallet>/0/address.evm`.
 - EVM native balance: `/wallets/<wallet>/0/chains/<chain>/balance.raw`.
@@ -68,23 +64,14 @@ Every wallet route uses the SDK's `wallet_param` helper. Current public paths:
 - Outbox entries: `/wallets/<wallet>/0/chains/<chain>/outbox/<pending|sent|failed>/<id>/`.
 - Solana recipient discovery: direct `address`, `balance`, and `balance.json`
   leaves under `/wallets/<wallet>/0/chains/<solana-chain>/`.
-  Solana origins remain unsupported.
 
-The account-0 address is persisted with each new session and checked before
-subsequent operations. Missing account-0 addresses never fall back to wallet-root
-addresses. Nonzero session bindings and account-selector request fields are
-rejected. Older sessions without an account binding remain readable but require
-manual recovery before execution.
-
-The Petal retains canonical `tx_stage`, `tx_confirm`, and `tx_inspect` host imports
-with wallet and chain names. Bloom selects the wallet's account 0 and retains
-Broker authorization, simulation, policy, and signing. Before confirmation or
-inspection, the Petal verifies the sender and deposit bytes in the exact account-0
-outbox entry. No reserved `bloom.*` context fields are fabricated.
+Each session records the selected wallet's account-0 address and checks it before
+subsequent operations. Before confirmation or inspection, the Petal verifies the
+sender and deposit bytes in the session's exact outbox entry. Bloom handles
+Broker authorization, simulation, policy, signing, and broadcast through its
+canonical transaction host interfaces.
 
 After an ambiguous confirmation, retry `confirm` or `refresh` to inspect the same
 outbox entry. The Petal never automatically rebroadcasts it. If inspection remains
 pending without a hash, use Bloom's reconciliation and approval surfaces; do not
 create another swap to work around the ambiguity.
-
-See [the migration contract and validation](docs/bloom-v0.3-migration.md).
