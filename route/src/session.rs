@@ -52,6 +52,11 @@ pub struct Session {
     /// 1Click blockchain code the output settles on, for the venue policy.
     #[serde(default)]
     pub destination_chain: Option<String>,
+    /// Whether the quote was requested with a partner credential. An
+    /// unauthenticated quote carries 1Click's higher platform fee, so the
+    /// owner sees which one they are approving.
+    #[serde(default)]
+    pub quote_authenticated: Option<bool>,
     pub prepared_transaction: Option<PreparedTransaction>,
     pub prepared_digest: Option<String>,
     pub plan_md: Option<String>,

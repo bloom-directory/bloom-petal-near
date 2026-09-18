@@ -27,9 +27,13 @@ pub fn load<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<Session, St
         .ok_or("session not found")?;
     serde_json::from_slice(&raw).map_err(|e| format!("corrupt session: {e}"))
 }
-fn jwt<H: Host>(host: &mut H) -> Result<PartnerJwt, String> {
+/// The 1Click credential, when this wallet has one. 1Click serves
+/// unauthenticated callers at a higher platform fee, so a missing key is not a
+/// gate; the quote records which path it took so the owner sees the cost.
+fn jwt<H: Host>(host: &mut H) -> Result<Option<PartnerJwt>, String> {
     let private_store = host.get_secret(settings::JWT_KEY, 8192)?;
-    settings::configured_partner_jwt(private_store.as_deref()).map(|resolved| resolved.jwt)
+    settings::optional_partner_jwt(private_store.as_deref())
+        .map(|resolved| resolved.map(|resolved| resolved.jwt))
 }
 
 fn acquire_lock<H: Host>(host: &mut H, key: &str, ttl_ms: u64) -> Result<Vec<u8>, String> {
@@ -38,9 +42,20 @@ fn acquire_lock<H: Host>(host: &mut H, key: &str, ttl_ms: u64) -> Result<Vec<u8>
         owner: String,
         expires_ms: u64,
     }
+    // An expired lock is reclaimable, and so is a stored value that no longer
+    // parses. A value that cannot be read back as a lock is never a live one:
+    // the host serializes store operations, so a reader cannot observe a
+    // half-written body, and every lock this Petal writes is valid JSON. What
+    // it can be is the debris of a write that died between creating the key and
+    // flushing its body. Leaving that debris in place would wedge the session
+    // permanently, because confirm, refresh, and abandon all take this lock
+    // first and `put-new` refuses a key that exists. Reclaiming through
+    // `delete-if-value` stays safe against a live contender: the compare fails
+    // if anyone replaced the value in the meantime.
     if let Some(existing) = host.get(key, 1024)?
-        && let Ok(lock) = serde_json::from_slice::<Lock>(&existing)
-        && lock.expires_ms <= host.now_ms()
+        && serde_json::from_slice::<Lock>(&existing)
+            .map(|lock| lock.expires_ms <= host.now_ms())
+            .unwrap_or(true)
     {
         host.delete_if(key, &existing)?;
     }
@@ -424,7 +439,8 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
         app_fees: None,
     };
     let result: Result<String, String> = (|| {
-        let (quote, raw) = api::quote(host, &jwt, &sent)?;
+        let authenticated = jwt.is_some();
+        let (quote, raw) = api::quote(host, jwt.as_ref(), &sent)?;
         // Retain bounded, private evidence before validation so a signed quote
         // rejected by policy can be reviewed without rerunning it.
         host.put(&format!("swaps/{wallet}/{id}/quote.raw.json"), &raw, false)?;
@@ -468,6 +484,7 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
             quote_verified: true,
             policy_checks: Some(policy_checks),
             destination_chain: Some(destination_chain.clone()),
+            quote_authenticated: Some(authenticated),
             prepared_transaction: None,
             prepared_digest: None,
             plan_md: None,
@@ -751,9 +768,18 @@ fn refresh_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
         if s.terminal() {
             return Ok(());
         }
-        if s.outbox_id.is_some() && s.origin_tx_hash.is_none() {
-            inspect_outbox(host, &mut s)?;
-            s = load(host, wallet, id)?;
+        // Upstream keys its status by deposit address, so it answers about that
+        // address whether or not this session ever funded it. Polling before an
+        // origin transaction exists therefore lets an unrelated answer drive
+        // this session's state machine, and the terminal settled states it maps
+        // to would strand a swap the owner has not yet executed. Learn the hash
+        // from the owned outbox entry when there is one, and otherwise leave
+        // the session where confirm can still advance it.
+        if s.origin_tx_hash.is_none() {
+            if s.outbox_id.is_some() {
+                inspect_outbox(host, &mut s)?;
+                s = load(host, wallet, id)?;
+            }
             if s.origin_tx_hash.is_none() {
                 s.last_error = None;
                 save(host, &s)?;
@@ -768,7 +794,7 @@ fn refresh_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
             save(host, &s)?;
             match api::submit(
                 host,
-                &jwt,
+                jwt.as_ref(),
                 &hash,
                 s.quote.quote.deposit_address.as_deref().unwrap(),
             ) {
@@ -786,7 +812,7 @@ fn refresh_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
         }
         let (status, raw) = match api::status(
             host,
-            &jwt,
+            jwt.as_ref(),
             s.quote.quote.deposit_address.as_deref().unwrap(),
         ) {
             Ok(value) => value,
@@ -873,6 +899,18 @@ pub fn abandon<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<(), Stri
         {
             return Err("cannot abandon after an outbox transaction exists".into());
         }
+        // The staging marker means an outbox entry may exist that this session
+        // never recorded an ID for, so `outbox_id` being empty proves nothing.
+        // Confirm already refuses to restage on this evidence; abandoning would
+        // instead close the session as "abandoned before deposit" and leave
+        // that entry orphaned behind a record saying it cannot exist.
+        if s.staging_started || matches!(s.state.as_str(), "staging_started" | "staging_ambiguous")
+        {
+            return Err(
+                "cannot abandon while a staged outbox entry may exist; reconcile the outbox first"
+                    .into(),
+            );
+        }
         s.transition(host.now_ms(), "abandoned", "user abandoned before deposit");
         save(host, &s)
     })();
@@ -900,6 +938,7 @@ mod workflow_tests {
         confirm_calls: usize,
         submit_calls: usize,
         quote_calls: usize,
+        quote_authorized: Option<bool>,
         status_calls: usize,
         erc20: bool,
         stage_fails: bool,
@@ -992,11 +1031,18 @@ mod workflow_tests {
                 }
                 ("POST", "/v0/quote") => {
                     self.0.borrow_mut().quote_calls += 1;
+                    let sent = req
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k == "authorization")
+                        .map(|(_, v)| v.clone());
+                    // Either the partner credential, or no header at all: a
+                    // malformed one must never reach the venue.
                     assert!(
-                        req.headers
-                            .iter()
-                            .any(|(k, v)| k == "authorization" && v == &format!("Bearer {JWT}"))
+                        sent.is_none() || sent.as_deref() == Some(&format!("Bearer {JWT}")),
+                        "unexpected authorization header: {sent:?}"
                     );
+                    self.0.borrow_mut().quote_authorized = Some(sent.is_some());
                     let request_json: serde_json::Value =
                         serde_json::from_slice(&req.body).unwrap();
                     self.0.borrow_mut().quote_request_json = Some(request_json.clone());
@@ -1427,6 +1473,43 @@ mod workflow_tests {
             "deadline_seconds": 900
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_wallet_without_a_credential_still_swaps_unauthenticated() {
+        // 1Click serves unauthenticated callers at a higher platform fee, so a
+        // missing key is a cost, not a gate. The session records which path it
+        // took so the owner sees it before approving.
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = create_with_verifier(
+            &mut host,
+            "alice",
+            &swap_body("no-credential", WALLET),
+            test_verify,
+        )
+        .unwrap();
+        assert_eq!(shared.borrow().quote_calls, 1);
+        assert_eq!(shared.borrow().quote_authorized, Some(false));
+        let session = load(&mut host, "alice", &id).unwrap();
+        assert_eq!(session.quote_authenticated, Some(false));
+    }
+
+    #[test]
+    fn a_configured_credential_is_still_sent() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let id = create_with_verifier(
+            &mut host,
+            "alice",
+            &swap_body("with-credential", WALLET),
+            test_verify,
+        )
+        .unwrap();
+        assert_eq!(shared.borrow().quote_authorized, Some(true));
+        let session = load(&mut host, "alice", &id).unwrap();
+        assert_eq!(session.quote_authenticated, Some(true));
     }
 
     #[test]
@@ -1903,6 +1986,96 @@ mod workflow_tests {
             let mut input = request.clone();
             input[key] = value;
             assert!(serde_json::from_value::<NewSwapRequest>(input).is_err());
+        }
+    }
+
+    #[test]
+    fn a_lock_left_unreadable_by_a_crashed_write_is_reclaimed_rather_than_wedging_the_session() {
+        // `put-new` creates the key before it flushes the body, so a write that
+        // dies in between leaves a lock that exists but cannot be parsed. Every
+        // session operation takes this lock first, so refusing to reclaim it
+        // would make the session permanently unusable.
+        for debris in [Vec::new(), b"{".to_vec(), b"null".to_vec()] {
+            let shared = Rc::new(RefCell::new(Shared::default()));
+            let mut host = MockHost(shared.clone());
+            let id = bound_session(&mut host);
+            shared
+                .borrow_mut()
+                .store
+                .insert(format!("locks/swaps/alice/{id}"), debris);
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+            assert_eq!(load(&mut host, "alice", &id).unwrap().state, "prepared");
+        }
+    }
+
+    #[test]
+    fn a_live_lock_is_still_refused_while_it_holds() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        let held = serde_json::json!({"owner":"someone-else","expires_ms":u64::MAX}).to_string();
+        shared
+            .borrow_mut()
+            .store
+            .insert(format!("locks/swaps/alice/{id}"), held.into_bytes());
+        assert!(confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).is_err());
+        assert_eq!(shared.borrow().stage_calls, 0);
+    }
+
+    #[test]
+    fn abandoning_is_refused_while_a_staged_outbox_entry_may_exist() {
+        let shared = Rc::new(RefCell::new(Shared {
+            stage_fails: true,
+            ..Shared::default()
+        }));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        assert!(confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).is_err());
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "staging_ambiguous"
+        );
+        assert!(
+            abandon(&mut host, "alice", &id)
+                .unwrap_err()
+                .contains("reconcile the outbox first")
+        );
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "staging_ambiguous"
+        );
+    }
+
+    #[test]
+    fn a_quoted_swap_can_still_be_abandoned() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared);
+        let id = bound_session(&mut host);
+        abandon(&mut host, "alice", &id).unwrap();
+        assert_eq!(load(&mut host, "alice", &id).unwrap().state, "abandoned");
+    }
+
+    #[test]
+    fn refresh_does_not_poll_upstream_before_the_deposit_has_an_origin_transaction() {
+        // Upstream answers about the deposit address, not about this session,
+        // so a swap the owner has only quoted or prepared must not be moved to
+        // a settled state by it and left unconfirmable. Once an outbox entry
+        // exists the hash comes from that entry first, which
+        // `refresh_does_not_poll_upstream_before_outbox_has_a_hash` covers.
+        for transitions in 0..=1 {
+            let shared = Rc::new(RefCell::new(Shared::default()));
+            let mut host = MockHost(shared.clone());
+            let id = bound_session(&mut host);
+            for _ in 0..transitions {
+                confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+            }
+            let before = load(&mut host, "alice", &id).unwrap().state;
+            refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).unwrap();
+            assert_eq!(shared.borrow().status_calls, 0, "{before}");
+            let session = load(&mut host, "alice", &id).unwrap();
+            assert!(!session.terminal(), "{before} became {}", session.state);
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
         }
     }
 }

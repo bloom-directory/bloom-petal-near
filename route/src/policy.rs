@@ -20,6 +20,8 @@ pub const MAX_POLICY_BYTES: usize = 64 * 1024;
 
 /// The recipient class meaning "this wallet's own address".
 pub const WALLET_ADDRESS_CLASS: &str = "class:wallet_address";
+/// Reserved prefix for named classes, so a typo cannot become a literal address.
+const CLASS_PREFIX: &str = "class:";
 
 pub fn venue_policy_key(wallet: &str) -> String {
     format!("settings/wallets/{wallet}/venue.toml")
@@ -150,16 +152,10 @@ impl VenuePolicy {
             }
         }
         for entry in &self.recipients.allowed {
-            if entry.trim().is_empty() || entry.len() > 1024 {
-                return Err("recipients.allowed entries must be 1..=1024 characters".into());
-            }
+            check_address_entry("recipients.allowed", entry)?;
         }
         for entry in &self.solvers.allowed_deposit_addresses {
-            if entry.trim().is_empty() || entry.len() > 1024 {
-                return Err(
-                    "solvers.allowed_deposit_addresses entries must be 1..=1024 characters".into(),
-                );
-            }
+            check_address_entry("solvers.allowed_deposit_addresses", entry)?;
         }
         Ok(())
     }
@@ -173,6 +169,32 @@ impl VenuePolicy {
             }
         })
     }
+}
+
+/// An address entry is matched literally, so a typo silently matches nothing
+/// and denies every swap. Addresses are not parsed here: a payout may settle on
+/// a chain whose address form is not EVM, such as a NEAR account id or a Solana
+/// address. What is checked is the shape a typo actually takes — stray
+/// whitespace, and a near-miss of a reserved `class:` name, which would
+/// otherwise be stored as a literal address that can never match.
+fn check_address_entry(field: &str, entry: &str) -> Result<(), String> {
+    if entry.trim().is_empty() || entry.len() > 1024 {
+        return Err(format!("{field} entries must be 1..=1024 characters"));
+    }
+    if entry.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "{field} entry {entry:?} contains whitespace; addresses are matched literally"
+        ));
+    }
+    if entry.len() >= CLASS_PREFIX.len()
+        && entry[..CLASS_PREFIX.len()].eq_ignore_ascii_case(CLASS_PREFIX)
+        && entry != WALLET_ADDRESS_CLASS
+    {
+        return Err(format!(
+            "{field} entry {entry:?} is not a known class; the only one is {WALLET_ADDRESS_CLASS:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// Read a wallet's stored policy, falling back to the bundled defaults. A
@@ -489,8 +511,11 @@ fn parse_decimal(value: &str) -> Option<u128> {
     {
         return None;
     }
-    // Two decimal places is enough to compare money; the rest rounds down, so a
-    // cap is never loosened by truncation.
+    // Two decimal places is enough to compare money. Both the cap and the value
+    // being checked truncate here, so the comparison can admit a value that
+    // exceeds the cap by less than a cent. That slack is bounded and immaterial
+    // against a USD ceiling, and it is the only rounding the check allows:
+    // a value this cannot read at all is refused rather than rounded.
     let mut cents = fraction.chars().chain("00".chars());
     let tenths = cents.next()?.to_digit(10)? as u128;
     let hundredths = cents.next()?.to_digit(10)? as u128;
@@ -665,5 +690,47 @@ mod tests {
         assert_eq!(parse_decimal(""), None);
         assert_eq!(parse_decimal("-1"), None);
         assert_eq!(parse_decimal("1e6"), None);
+    }
+
+    #[test]
+    fn a_class_typo_is_refused_rather_than_stored_as_an_address() {
+        // "class:" is reserved, so a near-miss cannot be quietly kept as a
+        // literal address that then matches nothing and denies every swap.
+        for entry in [
+            "class:wallet-address",
+            "class:wallet_addresses",
+            "CLASS:WALLET",
+            "class:",
+        ] {
+            let body = format!(
+                "[venue]\nenabled = true\n[limits]\nmax_slippage_bps = 100\n[limits.max_input_units]\n[recipients]\nallowed = [{entry:?}]\n[chains]\nallowed_origin = []\nallowed_destination = []\n[solvers]\nallowed_deposit_addresses = []\n"
+            );
+            let error = parse(body.as_bytes()).unwrap_err();
+            assert!(error.contains("not a known class"), "{entry}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_entry_with_whitespace_is_refused() {
+        let body = "[venue]\nenabled = true\n[limits]\nmax_slippage_bps = 100\n[limits.max_input_units]\n[recipients]\nallowed = [\"0xabc 0xdef\"]\n[chains]\nallowed_origin = []\nallowed_destination = []\n[solvers]\nallowed_deposit_addresses = []\n";
+        let error = parse(body.as_bytes()).unwrap_err();
+        assert!(error.contains("whitespace"), "{error}");
+    }
+
+    #[test]
+    fn a_non_evm_payout_address_is_still_allowed() {
+        // A destination chain may not use EVM addresses, so entries are not
+        // parsed as 0x addresses.
+        for entry in [
+            "treasury.near",
+            "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+            "0x48aae23db69acae2da2f6bf43ec5eb1996cb1245",
+        ] {
+            let body = format!(
+                "[venue]\nenabled = true\n[limits]\nmax_slippage_bps = 100\n[limits.max_input_units]\n[recipients]\nallowed = [{entry:?}]\n[chains]\nallowed_origin = []\nallowed_destination = []\n[solvers]\nallowed_deposit_addresses = []\n"
+            );
+            let policy = parse(body.as_bytes()).unwrap_or_else(|e| panic!("{entry}: {e}"));
+            assert!(policy.recipient_allowed(entry, "0x0000000000000000000000000000000000000000"));
+        }
     }
 }
