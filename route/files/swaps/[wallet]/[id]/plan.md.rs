@@ -12,16 +12,6 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         Ok(value) => value,
         Err(error) => return petal::error(-1, error),
     };
-    if let Some(outbox) = &session.plan_md {
-        return petal::DispatchResponse::Read(
-            format!(
-                "# NEAR Intents 1Click swap\n\nThe following is Bloom's authoritative transaction plan.\n\n{outbox}"
-            )
-            .into_bytes(),
-        );
-    }
-    let quote = &session.quote.quote;
-    let origin = &session.origin;
     let venue_policy = session
         .policy_checks
         .as_ref()
@@ -40,6 +30,20 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
                 .collect::<String>()
         })
         .unwrap_or_else(|| "- not evaluated\n".into());
+    // Once the deposit is staged this route serves Bloom's outbox plan, and
+    // that is what the owner reads when approving. The guard-rail result has
+    // to travel with it: rendering the venue policy only before staging would
+    // hide it at the one moment it decides anything.
+    if let Some(outbox) = &session.plan_md {
+        return petal::DispatchResponse::Read(
+            format!(
+                "# NEAR Intents 1Click swap\n\nThe following is Bloom's authoritative transaction plan.\n\n{outbox}\n\n## Venue policy\n\nThis wallet's own rules, at `settings/wallets/<wallet>/venue.toml`. They are\nguard rails the Petal enforces; Bloom's wallet policy still decides what may be\nsigned.\n\n{venue_policy}"
+            )
+            .into_bytes(),
+        );
+    }
+    let quote = &session.quote.quote;
+    let origin = &session.origin;
     let transaction = session.prepared_transaction.as_ref();
     let app_fee = session
         .quote

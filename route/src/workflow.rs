@@ -597,9 +597,19 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
         verifier(&s.quote)?;
         // The venue policy may have been tightened since the quote, so it is
         // enforced again before anything is prepared, staged, or submitted.
-        let checks =
-            enforce_venue_policy(&crate::policy::load(host, wallet)?, &session_context(&s))?;
-        s.policy_checks = Some(checks);
+        //
+        // The outcome is stored before a denial is returned. policy_check.json
+        // and the plan are the record of why a confirm was refused, and
+        // returning first would leave them showing the passing result from the
+        // quote — misleading exactly when something was denied.
+        let venue = crate::policy::load(host, wallet)?;
+        let checks = crate::policy::evaluate(&venue, &session_context(&s));
+        s.policy_checks = Some(checks.clone());
+        if let Some(reason) = crate::policy::deny_reason(&checks) {
+            s.last_error = Some(crate::redaction::sanitize_message(&reason));
+            save(host, &s)?;
+            return Err(reason);
+        }
         match s.state.as_str() {
             "quoted" => {
                 preflight(
@@ -1611,6 +1621,40 @@ mod workflow_tests {
             test_verify,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_confirm_denied_by_a_tightened_policy_records_the_denial() {
+        // The stored checks are the record of why a confirm was refused.
+        // Returning the denial without saving would leave policy_check.json
+        // and the plan showing the passing result from the quote.
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let id = create_with_verifier(
+            &mut host,
+            "alice",
+            &swap_body("tightened-session", WALLET),
+            test_verify,
+        )
+        .unwrap();
+        let quoted = load(&mut host, "alice", &id).unwrap();
+        assert!(
+            crate::policy::deny_reason(quoted.policy_checks.as_ref().unwrap()).is_none(),
+            "the quote should have passed"
+        );
+
+        crate::policy::write(&mut host, "alice", b"[limits]\nmax_input_usd = \"0.005\"\n").unwrap();
+        let error =
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap_err();
+        assert!(error.contains("limits.input_usd"), "{error}");
+
+        let denied = load(&mut host, "alice", &id).unwrap();
+        let checks = denied.policy_checks.as_ref().expect("checks persisted");
+        assert!(
+            crate::policy::deny_reason(checks).is_some_and(|r| r.contains("limits.input_usd")),
+            "{checks:?}"
+        );
     }
 
     #[test]

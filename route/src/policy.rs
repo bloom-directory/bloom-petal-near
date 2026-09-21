@@ -163,9 +163,9 @@ impl VenuePolicy {
     fn recipient_allowed(&self, recipient: &str, wallet_address: &str) -> bool {
         self.recipients.allowed.iter().any(|entry| {
             if entry == WALLET_ADDRESS_CLASS {
-                recipient.eq_ignore_ascii_case(wallet_address)
+                same_address(recipient, wallet_address)
             } else {
-                entry.eq_ignore_ascii_case(recipient)
+                same_address(entry, recipient)
             }
         })
     }
@@ -368,11 +368,13 @@ pub fn evaluate(policy: &VenuePolicy, ctx: &SwapContext<'_>) -> serde_json::Valu
             format!("input value is checked against the {cap} USD cap once quoted"),
         ),
         (Some(cap), Some(value)) => match (parse_decimal(cap), parse_decimal(value)) {
-            (Some(cap_units), Some(value_units)) if value_units <= cap_units => check(
-                "limits.input_usd",
-                "pass",
-                format!("input valued at {value} USD; wallet cap {cap} USD"),
-            ),
+            (Some(cap_units), Some(value_units)) if decimal_at_most(&value_units, &cap_units) => {
+                check(
+                    "limits.input_usd",
+                    "pass",
+                    format!("input valued at {value} USD; wallet cap {cap} USD"),
+                )
+            }
             (Some(_), Some(_)) => check(
                 "limits.input_usd",
                 "deny",
@@ -435,7 +437,7 @@ pub fn evaluate(policy: &VenuePolicy, ctx: &SwapContext<'_>) -> serde_json::Valu
                 "the deposit address is checked against the allowlist once quoted",
             ),
             Some(address)
-                if contains_ignore_case(&policy.solvers.allowed_deposit_addresses, address) =>
+                if contains_address(&policy.solvers.allowed_deposit_addresses, address) =>
             {
                 check(
                     "solvers.deposit_address",
@@ -486,8 +488,36 @@ fn describe_recipients(policy: &VenuePolicy, wallet_address: &str) -> String {
     described.join(", ")
 }
 
+/// Chain names and venue chain codes are ASCII labels, so they compare
+/// case-insensitively. Addresses do not — see [`same_address`].
 fn contains_ignore_case(set: &BTreeSet<String>, needle: &str) -> bool {
     set.iter().any(|entry| entry.eq_ignore_ascii_case(needle))
+}
+
+fn contains_address(set: &BTreeSet<String>, needle: &str) -> bool {
+    set.iter().any(|entry| same_address(entry, needle))
+}
+
+/// Whether two destination strings name the same address.
+///
+/// An EVM address is hex whose letter case carries only an optional EIP-55
+/// checksum, so two spellings of one address are the same address and compare
+/// case-insensitively. Everything else compares exactly: a Solana base58 key
+/// and a NEAR account id are case-sensitive, and folding case there would let
+/// a *different*, real address match an allowlisted one — a mis-cased
+/// recipient would be paid instead of refused.
+fn same_address(left: &str, right: &str) -> bool {
+    if is_evm_address(left) && is_evm_address(right) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+fn is_evm_address(value: &str) -> bool {
+    value.len() == 42
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Compare two canonical integers of any length.
@@ -498,9 +528,24 @@ fn less_or_equal_decimal_digits(left: &str, right: &str) -> bool {
     left <= right
 }
 
-/// Parse a positive decimal amount such as "250" or "12.50" into hundredths of
-/// a unit. Returns `None` for anything else, including negatives.
-fn parse_decimal(value: &str) -> Option<u128> {
+/// A positive decimal amount, kept exactly rather than rounded to a scale.
+///
+/// A cap is a maximum: it has to refuse everything above it, including the
+/// fractions below whatever unit the code happens to find convenient. An
+/// earlier version compared hundredths, which let a cap of "250" admit
+/// 250.009 — under a cent over, but over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Decimal {
+    /// Canonical integer part: no leading zeros, "0" when empty.
+    whole: String,
+    /// Fractional digits with trailing zeros removed.
+    fraction: String,
+}
+
+/// Parse a positive decimal amount such as "250" or "12.50". Returns `None`
+/// for anything else, including negatives and exponents, so a value this
+/// cannot read is refused rather than rounded.
+fn parse_decimal(value: &str) -> Option<Decimal> {
     let trimmed = value.trim();
     let (whole, fraction) = trimmed.split_once('.').unwrap_or((trimmed, ""));
     if whole.is_empty()
@@ -511,18 +556,33 @@ fn parse_decimal(value: &str) -> Option<u128> {
     {
         return None;
     }
-    // Two decimal places is enough to compare money. Both the cap and the value
-    // being checked truncate here, so the comparison can admit a value that
-    // exceeds the cap by less than a cent. That slack is bounded and immaterial
-    // against a USD ceiling, and it is the only rounding the check allows:
-    // a value this cannot read at all is refused rather than rounded.
-    let mut cents = fraction.chars().chain("00".chars());
-    let tenths = cents.next()?.to_digit(10)? as u128;
-    let hundredths = cents.next()?.to_digit(10)? as u128;
-    let whole: u128 = whole.parse().ok()?;
-    whole
-        .checked_mul(100)?
-        .checked_add(tenths * 10 + hundredths)
+    let stripped = whole.trim_start_matches('0');
+    Some(Decimal {
+        whole: if stripped.is_empty() {
+            "0".to_owned()
+        } else {
+            stripped.to_owned()
+        },
+        fraction: fraction.trim_end_matches('0').to_owned(),
+    })
+}
+
+/// Whether `left` is at most `right`, compared at full precision.
+fn decimal_at_most(left: &Decimal, right: &Decimal) -> bool {
+    if left.whole != right.whole {
+        return less_or_equal_decimal_digits(&left.whole, &right.whole);
+    }
+    // Same integer part: pad both fractions to one width so a plain digit
+    // comparison orders them.
+    let width = left.fraction.len().max(right.fraction.len());
+    let pad = |digits: &str| -> String {
+        digits
+            .chars()
+            .chain(std::iter::repeat('0'))
+            .take(width)
+            .collect()
+    };
+    pad(&left.fraction) <= pad(&right.fraction)
 }
 
 #[cfg(test)]
@@ -682,14 +742,89 @@ mod tests {
         assert!(parse(b"[recipients]\nallowed = [\"\"]\n").is_err());
     }
 
+    fn decimal(value: &str) -> Decimal {
+        parse_decimal(value).unwrap_or_else(|| panic!("{value} should parse"))
+    }
+
     #[test]
     fn money_parses_without_floating_point() {
-        assert_eq!(parse_decimal("250"), Some(25_000));
-        assert_eq!(parse_decimal("12.5"), Some(1_250));
-        assert_eq!(parse_decimal("0.019"), Some(1));
+        assert_eq!(decimal("250").whole, "250");
+        assert_eq!(decimal("250").fraction, "");
+        assert_eq!(decimal("12.50").fraction, "5");
+        assert_eq!(decimal("0.019").whole, "0");
+        assert_eq!(decimal("0.019").fraction, "019");
+        assert_eq!(decimal("007.10"), decimal("7.1"));
         assert_eq!(parse_decimal(""), None);
         assert_eq!(parse_decimal("-1"), None);
         assert_eq!(parse_decimal("1e6"), None);
+    }
+
+    #[test]
+    fn a_non_evm_payout_address_is_matched_exactly() {
+        // Solana base58 is case-sensitive: these are two different real keys.
+        // Folding case would pay the second while the owner allowed the first.
+        let allowed = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+        let miscased = "7XkxTG2cw87D97txjsdPBd5JbKHEtQa83tzrUjOSGaSu";
+        assert!(!same_address(allowed, miscased));
+        assert!(same_address(allowed, allowed));
+        // NEAR account ids are lowercase by rule, but still compared exactly.
+        assert!(!same_address("treasury.near", "Treasury.near"));
+        // EVM addresses carry only an EIP-55 checksum in their case, so the
+        // same address in two spellings is still one address.
+        assert!(same_address(
+            "0x48Aae23Db69ACae2DA2F6bF43Ec5eB1996Cb1245",
+            "0x48aae23db69acae2da2f6bf43ec5eb1996cb1245"
+        ));
+        // A 0x string that is not address-shaped falls back to exact match.
+        assert!(!same_address("0xABC", "0xabc"));
+    }
+
+    #[test]
+    fn a_miscased_recipient_is_denied_rather_than_paid() {
+        let policy = parse(
+            b"[venue]\nenabled = true\n[limits]\nmax_slippage_bps = 100\n[limits.max_input_units]\n[recipients]\nallowed = [\"7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU\"]\n[chains]\nallowed_origin = []\nallowed_destination = []\n[solvers]\nallowed_deposit_addresses = []\n",
+        )
+        .unwrap();
+        let mut ctx = context("7XkxTG2cw87D97txjsdPBd5JbKHEtQa83tzrUjOSGaSu", WALLET);
+        ctx.amount_in_usd = None;
+        let checks = evaluate(&policy, &ctx);
+        assert!(
+            deny_reason(&checks).is_some_and(|reason| reason.contains("recipients.allowed")),
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn a_cap_refuses_everything_above_it_including_sub_cent_overage() {
+        // The earlier comparison truncated to hundredths, so a "250" cap
+        // admitted 250.009. A maximum has to mean maximum.
+        assert!(decimal_at_most(&decimal("250"), &decimal("250")));
+        assert!(decimal_at_most(&decimal("249.999999"), &decimal("250")));
+        assert!(!decimal_at_most(&decimal("250.009"), &decimal("250")));
+        assert!(!decimal_at_most(
+            &decimal("250.000000000000000001"),
+            &decimal("250")
+        ));
+        // Ordering still holds across differing widths and integer lengths.
+        assert!(decimal_at_most(&decimal("9.9"), &decimal("10")));
+        assert!(!decimal_at_most(&decimal("10"), &decimal("9.9")));
+        assert!(decimal_at_most(&decimal("2.1"), &decimal("2.10000")));
+        assert!(!decimal_at_most(&decimal("2.2"), &decimal("2.10000")));
+    }
+
+    #[test]
+    fn a_swap_one_hundredth_over_the_cap_is_denied() {
+        let policy = parse(
+            b"[venue]\nenabled = true\n[limits]\nmax_slippage_bps = 100\nmax_input_usd = \"250\"\n[limits.max_input_units]\n[recipients]\nallowed = [\"class:wallet_address\"]\n[chains]\nallowed_origin = []\nallowed_destination = []\n[solvers]\nallowed_deposit_addresses = []\n",
+        )
+        .unwrap();
+        let mut ctx = context(WALLET, WALLET);
+        ctx.amount_in_usd = Some("250.009");
+        let checks = evaluate(&policy, &ctx);
+        assert!(
+            deny_reason(&checks).is_some_and(|reason| reason.contains("limits.input_usd")),
+            "{checks:?}"
+        );
     }
 
     #[test]
