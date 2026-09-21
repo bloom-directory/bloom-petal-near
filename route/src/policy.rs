@@ -140,7 +140,7 @@ impl VenuePolicy {
             return Err("limits.max_slippage_bps must be at most 10000".into());
         }
         if let Some(cap) = &self.limits.max_input_usd
-            && parse_decimal(cap).is_none()
+            && parse_decimal(cap).is_none_or(|cap| cap.is_zero())
         {
             return Err("limits.max_input_usd must be a positive decimal amount".into());
         }
@@ -386,6 +386,13 @@ pub fn evaluate(policy: &VenuePolicy, ctx: &SwapContext<'_>) -> serde_json::Valu
     );
 
     checks.push(match (&policy.limits.max_input_usd, ctx.amount_in_usd) {
+        // The value is stored and shown to the owner, so an unreadable one is
+        // refused whether or not a cap is configured.
+        (None, Some(value)) if parse_decimal(value).is_none() => check(
+            "limits.input_usd",
+            "deny",
+            format!("the venue reported an unusable input value {value:?}"),
+        ),
         (None, _) => check("limits.input_usd", "pass", "no USD cap is configured"),
         (Some(cap), None) => check(
             "limits.input_usd",
@@ -415,6 +422,11 @@ pub fn evaluate(policy: &VenuePolicy, ctx: &SwapContext<'_>) -> serde_json::Valu
 
     let unit_cap = policy.limits.max_input_units.get(ctx.origin_asset);
     checks.push(match (unit_cap, ctx.amount_in) {
+        (None, Some(amount)) if !crate::input::canonical_amount(amount) => check(
+            "limits.input_units",
+            "deny",
+            format!("the venue reported an unusable input amount {amount:?}"),
+        ),
         (None, _) => check(
             "limits.input_units",
             "pass",
@@ -567,12 +579,18 @@ struct Decimal {
     fraction: String,
 }
 
-/// Parse a positive decimal amount such as "250" or "12.50". Returns `None`
-/// for anything else, including negatives and exponents, so a value this
-/// cannot read is refused rather than rounded.
+/// Parse a non-negative decimal amount such as "250", "12.50" or "0". The
+/// grammar is strict: digits, then optionally a point followed by at least one
+/// digit. No whitespace, sign, or exponent, and neither side of the point may
+/// be empty, so "5." and ".5" are refused. Returns `None` for anything else,
+/// so a value this cannot read is refused rather than rounded. A cap must
+/// also be non-zero; see [`Decimal::is_zero`].
 fn parse_decimal(value: &str) -> Option<Decimal> {
-    let trimmed = value.trim();
-    let (whole, fraction) = trimmed.split_once('.').unwrap_or((trimmed, ""));
+    let (whole, fraction) = match value.split_once('.') {
+        Some((_, "")) => return None,
+        Some(parts) => parts,
+        None => (value, ""),
+    };
     if whole.is_empty()
         || whole.len() > 24
         || fraction.len() > 18
@@ -590,6 +608,12 @@ fn parse_decimal(value: &str) -> Option<Decimal> {
         },
         fraction: fraction.trim_end_matches('0').to_owned(),
     })
+}
+
+impl Decimal {
+    fn is_zero(&self) -> bool {
+        self.whole == "0" && self.fraction.is_empty()
+    }
 }
 
 /// Whether `left` is at most `right`, compared at full precision.
@@ -755,6 +779,60 @@ mod tests {
                 .unwrap()
                 .contains("venue.enabled")
         );
+    }
+
+    #[test]
+    fn decimal_grammar_is_strict() {
+        for bad in [
+            "", " 5", "5 ", " 5. ", "5.", ".5", "-1", "+1", "1e3", "1E3", "1_000", "1,5", "0x10",
+            "lots",
+        ] {
+            assert!(parse_decimal(bad).is_none(), "{bad:?} should be refused");
+        }
+        let too_whole = "1".repeat(25);
+        let too_fine = format!("1.{}", "1".repeat(19));
+        assert!(parse_decimal(&too_whole).is_none());
+        assert!(parse_decimal(&too_fine).is_none());
+        for good in ["0", "0.0", "5", "5.0", "12.50", "007", &"9".repeat(24)] {
+            assert!(parse_decimal(good).is_some(), "{good:?} should parse");
+        }
+        assert!(parse_decimal(&format!("1.{}", "1".repeat(18))).is_some());
+        assert!(parse_decimal("0.00").unwrap().is_zero());
+        assert!(!parse_decimal("0.01").unwrap().is_zero());
+    }
+
+    #[test]
+    fn a_zero_or_loosely_written_cap_is_refused() {
+        for cap in ["0", "0.0", "5.", " 5", "5 "] {
+            let body = format!("[limits]\nmax_input_usd = {cap:?}\n");
+            assert!(parse(body.as_bytes()).is_err(), "{cap:?}");
+        }
+        assert!(parse(b"[limits]\nmax_input_usd = \"0.01\"\n").is_ok());
+    }
+
+    #[test]
+    fn an_unreadable_venue_value_is_denied_even_without_a_cap() {
+        // No USD cap and no unit cap are configured here.
+        let policy = parse(b"[limits]\nmax_slippage_bps = 100\n").unwrap();
+        assert!(policy.limits.max_input_usd.is_none());
+        for value in ["1e999", "-5", "lots", "5.", " 5"] {
+            let mut ctx = context(WALLET, WALLET);
+            ctx.amount_in_usd = Some(value);
+            let reason = deny_reason(&evaluate(&policy, &ctx)).expect(value);
+            assert!(reason.contains("limits.input_usd"), "{reason}");
+        }
+        let overlong = "1".repeat(79);
+        for amount in ["not-a-number", "0", "007", overlong.as_str()] {
+            let mut ctx = context(WALLET, WALLET);
+            ctx.amount_in = Some(amount);
+            let reason = deny_reason(&evaluate(&policy, &ctx)).expect(amount);
+            assert!(reason.contains("limits.input_units"), "{reason}");
+        }
+        // A readable value, zero included, still passes without a cap.
+        let mut ctx = context(WALLET, WALLET);
+        ctx.amount_in_usd = Some("0.00");
+        ctx.amount_in = Some("1000");
+        assert_eq!(deny_reason(&evaluate(&policy, &ctx)), None);
     }
 
     #[test]

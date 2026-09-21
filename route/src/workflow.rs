@@ -362,6 +362,13 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
     body: &[u8],
     verifier: V,
 ) -> Result<String, String> {
+    if body.len() > crate::input::MAX_SWAP_REQUEST_BYTES {
+        return Err(format!(
+            "swap request is {} bytes; the limit is {}",
+            body.len(),
+            crate::input::MAX_SWAP_REQUEST_BYTES
+        ));
+    }
     let req: NewSwapRequest =
         serde_json::from_slice(body).map_err(|e| format!("swap request JSON: {e}"))?;
     req.validate()?;
@@ -948,6 +955,7 @@ mod workflow_tests {
         confirm_calls: usize,
         submit_calls: usize,
         quote_calls: usize,
+        http_calls: usize,
         quote_authorized: Option<bool>,
         status_calls: usize,
         erc20: bool,
@@ -1029,6 +1037,7 @@ mod workflow_tests {
             Ok(Some("https://mock.invalid".into()))
         }
         fn http(&mut self, req: HttpRequest, _: usize) -> Result<HttpResponse, String> {
+            self.0.borrow_mut().http_calls += 1;
             let path = url::Url::parse(&req.url).unwrap().path().to_string();
             let body = match (req.method.as_str(), path.as_str()) {
                 ("GET", "/v0/tokens") => {
@@ -1654,6 +1663,36 @@ mod workflow_tests {
         assert!(
             crate::policy::deny_reason(checks).is_some_and(|r| r.contains("limits.input_usd")),
             "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_amount_or_body_is_refused_before_any_venue_request() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+
+        // 79 digits is past uint256, and so is the largest 78-digit string.
+        for amount in ["1".repeat(79), "9".repeat(78), "1".repeat(1_000_000)] {
+            let body = serde_json::to_vec(&serde_json::json!({"session_id":"overlong-amount-01","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":amount,"recipient":WALLET})).unwrap();
+            if body.len() > crate::input::MAX_SWAP_REQUEST_BYTES {
+                let error =
+                    create_with_verifier(&mut host, "alice", &body, test_verify).unwrap_err();
+                assert!(error.contains("the limit is"), "{error}");
+            } else {
+                let error =
+                    create_with_verifier(&mut host, "alice", &body, test_verify).unwrap_err();
+                assert!(error.contains("positive canonical integer"), "{error}");
+            }
+        }
+        assert_eq!(shared.borrow().http_calls, 0, "no token or quote request");
+        assert!(
+            !shared
+                .borrow()
+                .store
+                .keys()
+                .any(|k| k.contains("overlong-amount-01")),
+            "nothing persisted"
         );
     }
 

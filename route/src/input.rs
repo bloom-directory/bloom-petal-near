@@ -29,11 +29,23 @@ pub struct NewSwapRequest {
     pub refund_to: Option<String>,
 }
 
+/// Largest swap request body this Petal will parse. A request is a handful of
+/// short fields; anything larger is refused before it is deserialized.
+pub const MAX_SWAP_REQUEST_BYTES: usize = 16 * 1024;
+
+/// A uint256 has at most 78 decimal digits.
+const MAX_AMOUNT_DIGITS: usize = 78;
+
+/// A positive on-chain amount in canonical form: digits only, no leading zero,
+/// and within uint256. The length is checked first so an overlong string is
+/// refused without being scanned, hashed, stored, or sent to the venue.
 pub fn canonical_amount(value: &str) -> bool {
     !value.is_empty()
+        && value.len() <= MAX_AMOUNT_DIGITS
         && value != "0"
-        && value.bytes().all(|b| b.is_ascii_digit())
         && !value.starts_with('0')
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && alloy::primitives::U256::from_str_radix(value, 10).is_ok()
 }
 
 fn safe(value: &str, max: usize) -> bool {
