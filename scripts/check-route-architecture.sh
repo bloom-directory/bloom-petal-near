@@ -3,14 +3,16 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-if rg -n \
+# grep, not rg: ripgrep is not installed on the CI runner, and a missing
+# command inside `if` reads as "no match", so the check would pass unrun.
+if grep -rnE \
   'session_view|session_route|pub fn [a-zA-Z0-9_]+_route[[:space:]]*\(' \
   "$ROOT/route/src" "$ROOT/route/files"; then
   echo "route-facing dispatch facade found; route composition belongs in route/files" >&2
   exit 1
 fi
 
-if rg -n \
+if grep -rnE \
   'crate::(workflow::)?[a-zA-Z0-9_]+_route[[:space:]]*\(' \
   "$ROOT/route/files"; then
   echo "route file delegates to a route-mirroring facade" >&2
