@@ -962,6 +962,7 @@ mod workflow_tests {
         stage_fails: bool,
         corrupt_signature: bool,
         response_insured: Option<bool>,
+        response_amount_in_usd: Option<String>,
         response_app_fees: Option<Vec<crate::api_types::AppFee>>,
         inspect_pending: bool,
         malformed_status: bool,
@@ -990,7 +991,9 @@ mod workflow_tests {
         quote_signature::verify_with_key(q, &key).map_err(|e| e.to_string())
     }
 
-    fn signed_quote(req: QuoteRequest) -> QuoteResponse {
+    /// A validly signed quote whose `amountInUsd` is whatever the venue chose
+    /// to report, so a test can sign a value the policy should refuse.
+    fn signed_quote(req: QuoteRequest, amount_in_usd: &str) -> QuoteResponse {
         let mut q = QuoteResponse {
             correlation_id: "mock-correlation".into(),
             timestamp: "2027-01-15T08:00:00Z".into(),
@@ -1002,7 +1005,7 @@ mod workflow_tests {
                 chain_deposit_addresses: None,
                 amount_in: req.amount.clone(),
                 amount_in_formatted: "0.000000000000001".into(),
-                amount_in_usd: "0.01".into(),
+                amount_in_usd: amount_in_usd.into(),
                 min_amount_in: req.amount.clone(),
                 amount_out: "2000".into(),
                 amount_out_formatted: "0.002".into(),
@@ -1066,7 +1069,9 @@ mod workflow_tests {
                         serde_json::from_slice(&req.body).unwrap();
                     self.0.borrow_mut().quote_request_json = Some(request_json.clone());
                     let request: QuoteRequest = serde_json::from_value(request_json).unwrap();
-                    let mut quote = signed_quote(request);
+                    let reported_usd = self.0.borrow().response_amount_in_usd.clone();
+                    let mut quote =
+                        signed_quote(request, reported_usd.as_deref().unwrap_or("0.01"));
                     quote.quote_request.insured = self.0.borrow().response_insured;
                     quote.quote_request.app_fees = self.0.borrow().response_app_fees.clone();
                     if self.0.borrow().corrupt_signature {
@@ -1694,6 +1699,45 @@ mod workflow_tests {
                 .any(|k| k.contains("overlong-amount-01")),
             "nothing persisted"
         );
+    }
+
+    #[test]
+    fn a_signed_quote_with_an_unreadable_usd_value_is_refused_even_without_a_cap() {
+        // The quote is validly signed, so the signature check cannot be what
+        // stops it, and the wallet sets no USD cap. The value is stored and
+        // shown to the owner, so an unreadable one must still end the swap.
+        for reported in ["1e999", "-5", "lots", "5."] {
+            let shared = Rc::new(RefCell::new(Shared {
+                response_amount_in_usd: Some(reported.into()),
+                ..Shared::default()
+            }));
+            let mut host = MockHost(shared.clone());
+            write_api_key(&mut host, JWT.as_bytes()).unwrap();
+            crate::policy::write(&mut host, "alice", b"[limits]\nmax_slippage_bps = 100\n")
+                .unwrap();
+            assert!(
+                crate::policy::load(&mut host, "alice")
+                    .unwrap()
+                    .limits
+                    .max_input_usd
+                    .is_none()
+            );
+
+            let error = create_with_verifier(
+                &mut host,
+                "alice",
+                &swap_body("unreadable-usd-value", WALLET),
+                test_verify,
+            )
+            .unwrap_err();
+            assert!(error.contains("limits.input_usd"), "{reported}: {error}");
+            assert_eq!(shared.borrow().quote_calls, 1, "the quote was requested");
+            assert_eq!(shared.borrow().stage_calls, 0, "nothing was staged");
+            let quoted = load(&mut host, "alice", "unreadable-usd-value")
+                .map(|session| session.state == "quoted")
+                .unwrap_or(false);
+            assert!(!quoted, "{reported}: no quoted session may exist");
+        }
     }
 
     #[test]
