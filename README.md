@@ -46,6 +46,19 @@ Changing the file needs no ceremony, so these are guard rails, not custody.
 Bloom's wallet policy still decides which package may act and every deposit
 transaction is approved by the owner.
 
+Which check stops what:
+
+| Risk | What stops it |
+| --- | --- |
+| Another Petal, or a hand-staged transaction, sending to a 1Click deposit address | Bloom's wallet policy. Its `petal:near-intents` destination covers only transactions this Petal stages |
+| This Petal staging a deposit the owner did not intend | The owner's approval of each deposit transaction, against Bloom's outbox plan |
+| A swap paying out somewhere other than the wallet, or exceeding a limit | This venue policy. Bloom cannot check it: the payout happens on the venue's side, not in the transaction Bloom signs |
+| The venue naming a deposit address of its choosing | The signed-quote check. The venue policy can only pin deposit addresses for a venue that issues stable ones |
+
+The venue policy is the only check on the payout address, so it matters most
+for a custodian. It is also the weakest: whoever can write to the Petal can
+change it without a ceremony.
+
 A custodian pins payouts and tightens the limits, for example:
 
 ```toml

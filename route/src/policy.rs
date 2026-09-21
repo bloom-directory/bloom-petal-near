@@ -157,6 +157,31 @@ impl VenuePolicy {
         for entry in &self.solvers.allowed_deposit_addresses {
             check_address_entry("solvers.allowed_deposit_addresses", entry)?;
         }
+        // A chain entry that can never match denies every swap without saying
+        // why. Origin chains are a closed set, so a misspelling is caught
+        // here; destination codes are the venue's, so only their shape is.
+        for entry in &self.chains.allowed_origin {
+            if !crate::assets::CHAINS
+                .iter()
+                .any(|chain| chain.bloom.eq_ignore_ascii_case(entry))
+            {
+                let known: Vec<&str> = crate::assets::CHAINS.iter().map(|c| c.bloom).collect();
+                return Err(format!(
+                    "chains.allowed_origin entry {entry:?} is not a chain this Petal spends from; known chains are {}",
+                    known.join(", ")
+                ));
+            }
+        }
+        for entry in &self.chains.allowed_destination {
+            if entry.is_empty()
+                || entry.len() > 64
+                || entry.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
+                return Err(format!(
+                    "chains.allowed_destination entry {entry:?} must be a 1..=64 character venue chain code without whitespace"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -730,6 +755,25 @@ mod tests {
                 .unwrap()
                 .contains("venue.enabled")
         );
+    }
+
+    #[test]
+    fn a_chain_entry_that_could_never_match_is_refused() {
+        // Each of these would otherwise store fine and then deny every swap.
+        for body in [
+            "[chains]\nallowed_origin = [\"arbitrum \"]\n",
+            "[chains]\nallowed_origin = [\"arbitrun\"]\n",
+            "[chains]\nallowed_origin = [\"\"]\n",
+            "[chains]\nallowed_destination = [\"arb \"]\n",
+            "[chains]\nallowed_destination = [\"\"]\n",
+        ] {
+            assert!(parse(body.as_bytes()).is_err(), "{body}");
+        }
+        // Case is forgiven, matching how the entries are compared.
+        let policy =
+            parse(b"[chains]\nallowed_origin = [\"Arbitrum\"]\nallowed_destination = [\"sol\"]\n")
+                .unwrap();
+        assert!(policy.chains.allowed_origin.contains("Arbitrum"));
     }
 
     #[test]
