@@ -27,9 +27,13 @@ pub fn load<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<Session, St
         .ok_or("session not found")?;
     serde_json::from_slice(&raw).map_err(|e| format!("corrupt session: {e}"))
 }
-fn jwt<H: Host>(host: &mut H) -> Result<PartnerJwt, String> {
+/// The 1Click credential, when this wallet has one. 1Click serves
+/// unauthenticated callers at a higher platform fee, so a missing key is not a
+/// gate; the quote records which path it took so the owner sees the cost.
+fn jwt<H: Host>(host: &mut H) -> Result<Option<PartnerJwt>, String> {
     let private_store = host.get_secret(settings::JWT_KEY, 8192)?;
-    settings::configured_partner_jwt(private_store.as_deref()).map(|resolved| resolved.jwt)
+    settings::optional_partner_jwt(private_store.as_deref())
+        .map(|resolved| resolved.map(|resolved| resolved.jwt))
 }
 
 fn acquire_lock<H: Host>(host: &mut H, key: &str, ttl_ms: u64) -> Result<Vec<u8>, String> {
@@ -38,9 +42,20 @@ fn acquire_lock<H: Host>(host: &mut H, key: &str, ttl_ms: u64) -> Result<Vec<u8>
         owner: String,
         expires_ms: u64,
     }
+    // An expired lock is reclaimable, and so is a stored value that no longer
+    // parses. A value that cannot be read back as a lock is never a live one:
+    // the host serializes store operations, so a reader cannot observe a
+    // half-written body, and every lock this Petal writes is valid JSON. What
+    // it can be is the debris of a write that died between creating the key and
+    // flushing its body. Leaving that debris in place would wedge the session
+    // permanently, because confirm, refresh, and abandon all take this lock
+    // first and `put-new` refuses a key that exists. Reclaiming through
+    // `delete-if-value` stays safe against a live contender: the compare fails
+    // if anyone replaced the value in the meantime.
     if let Some(existing) = host.get(key, 1024)?
-        && let Ok(lock) = serde_json::from_slice::<Lock>(&existing)
-        && lock.expires_ms <= host.now_ms()
+        && serde_json::from_slice::<Lock>(&existing)
+            .map(|lock| lock.expires_ms <= host.now_ms())
+            .unwrap_or(true)
     {
         host.delete_if(key, &existing)?;
     }
@@ -196,6 +211,18 @@ fn validate_echo(
             return Err(format!("quote {name} is not a positive integer"));
         }
     }
+    // Fees do not feed the transaction, but the plan shows them to the owner
+    // at the moment of approval, so an unreadable one ends the swap too.
+    for (name, value) in [
+        ("refundFee", &q.refund_fee),
+        ("withdrawFee", &q.withdraw_fee),
+    ] {
+        if let Some(value) = value
+            && !crate::input::canonical_fee(value)
+        {
+            return Err(format!("quote {name} is not a non-negative integer"));
+        }
+    }
     let u = |v: &str| {
         alloy::primitives::U256::from_str_radix(v, 10)
             .map_err(|_| "quote amount exceeds uint256".to_string())
@@ -296,6 +323,45 @@ fn preflight<H: Host>(
     Ok(())
 }
 
+/// The 1Click blockchain code an asset settles on, for the venue policy's
+/// destination check. An asset the venue does not list is reported as unknown,
+/// which only matters when a wallet restricts destinations.
+fn destination_chain_code(tokens: &[crate::api_types::TokenResponse], asset_id: &str) -> String {
+    tokens
+        .iter()
+        .find(|token| token.asset_id == asset_id)
+        .map(|token| token.blockchain.clone())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The venue policy view of a stored session.
+fn session_context(session: &Session) -> crate::policy::SwapContext<'_> {
+    crate::policy::SwapContext {
+        wallet_address: &session.wallet_address,
+        recipient: &session.quote.quote_request.recipient,
+        slippage_bps: session.quote.quote_request.slippage_tolerance,
+        origin_chain: &session.origin.bloom_chain,
+        destination_chain: session.destination_chain.as_deref().unwrap_or("unknown"),
+        origin_asset: &session.origin.asset_id,
+        amount_in: Some(&session.quote.quote.amount_in),
+        amount_in_usd: Some(&session.quote.quote.amount_in_usd),
+        deposit_address: session.quote.quote.deposit_address.as_deref(),
+    }
+}
+
+/// Evaluate the wallet's venue policy and refuse on the first denial. The
+/// checks are returned so they can be stored and shown in the plan.
+fn enforce_venue_policy(
+    policy: &crate::policy::VenuePolicy,
+    ctx: &crate::policy::SwapContext<'_>,
+) -> Result<serde_json::Value, String> {
+    let checks = crate::policy::evaluate(policy, ctx);
+    match crate::policy::deny_reason(&checks) {
+        Some(reason) => Err(reason),
+        None => Ok(checks),
+    }
+}
+
 pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String, String> {
     create_with_verifier(host, wallet, body, |quote| {
         quote_signature::verify(quote).map_err(|e| e.to_string())
@@ -308,6 +374,13 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
     body: &[u8],
     verifier: V,
 ) -> Result<String, String> {
+    if body.len() > crate::input::MAX_SWAP_REQUEST_BYTES {
+        return Err(format!(
+            "swap request is {} bytes; the limit is {}",
+            body.len(),
+            crate::input::MAX_SWAP_REQUEST_BYTES
+        ));
+    }
     let req: NewSwapRequest =
         serde_json::from_slice(body).map_err(|e| format!("swap request JSON: {e}"))?;
     req.validate()?;
@@ -321,6 +394,10 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
     {
         return Err("refund_to must equal the selected wallet address".into());
     }
+    let venue_policy = crate::policy::load(host, wallet)?;
+    if !venue_policy.venue.enabled {
+        return Err("venue policy denied [venue.enabled]: NEAR Intents swaps are disabled in this wallet's venue policy".into());
+    }
     let jwt = jwt(host)?;
     let (tokens, _raw_tokens) = api::tokens(host)?;
     let token = tokens
@@ -329,6 +406,22 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
         .cloned()
         .ok_or("origin asset not found")?;
     let origin = assets::resolve(&tokens, &req.origin_asset)?;
+    let destination_chain = destination_chain_code(&tokens, &req.destination_asset);
+    // Refuse a swap the wallet's own rules forbid before asking for a quote.
+    enforce_venue_policy(
+        &venue_policy,
+        &crate::policy::SwapContext {
+            wallet_address: &wallet_address,
+            recipient: &req.recipient,
+            slippage_bps: req.slippage_bps,
+            origin_chain: &origin.bloom_chain,
+            destination_chain: &destination_chain,
+            origin_asset: &req.origin_asset,
+            amount_in: None,
+            amount_in_usd: None,
+            deposit_address: None,
+        },
+    )?;
     let now = host.now_ms();
     let id = req.session_id.clone();
     let reservation = format!("swaps/{wallet}/{id}/reservation");
@@ -365,12 +458,27 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
         app_fees: None,
     };
     let result: Result<String, String> = (|| {
-        let (quote, raw) = api::quote(host, &jwt, &sent)?;
+        let authenticated = jwt.is_some();
+        let (quote, raw) = api::quote(host, jwt.as_ref(), &sent)?;
         // Retain bounded, private evidence before validation so a signed quote
         // rejected by policy can be reviewed without rerunning it.
         host.put(&format!("swaps/{wallet}/{id}/quote.raw.json"), &raw, false)?;
         let hash = verifier(&quote)?;
         validate_echo(&sent, &quote, &wallet_address, now)?;
+        // The quote decides the amount, its valuation, and the deposit address,
+        // so the remaining venue checks run against the signed quote.
+        let quoted = crate::policy::SwapContext {
+            wallet_address: &wallet_address,
+            recipient: &req.recipient,
+            slippage_bps: req.slippage_bps,
+            origin_chain: &origin.bloom_chain,
+            destination_chain: &destination_chain,
+            origin_asset: &req.origin_asset,
+            amount_in: Some(&quote.quote.amount_in),
+            amount_in_usd: Some(&quote.quote.amount_in_usd),
+            deposit_address: quote.quote.deposit_address.as_deref(),
+        };
+        let policy_checks = enforce_venue_policy(&venue_policy, &quoted)?;
         preflight(
             host,
             &origin,
@@ -393,6 +501,9 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
             quote,
             quote_hash: hash,
             quote_verified: true,
+            policy_checks: Some(policy_checks),
+            destination_chain: Some(destination_chain.clone()),
+            quote_authenticated: Some(authenticated),
             prepared_transaction: None,
             prepared_digest: None,
             plan_md: None,
@@ -503,6 +614,21 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
         }
         validate_echo(&s.quote.quote_request, &s.quote, &s.wallet_address, now)?;
         verifier(&s.quote)?;
+        // The venue policy may have been tightened since the quote, so it is
+        // enforced again before anything is prepared, staged, or submitted.
+        //
+        // The outcome is stored before a denial is returned. policy_check.json
+        // and the plan are the record of why a confirm was refused, and
+        // returning first would leave them showing the passing result from the
+        // quote — misleading exactly when something was denied.
+        let venue = crate::policy::load(host, wallet)?;
+        let checks = crate::policy::evaluate(&venue, &session_context(&s));
+        s.policy_checks = Some(checks.clone());
+        if let Some(reason) = crate::policy::deny_reason(&checks) {
+            s.last_error = Some(crate::redaction::sanitize_message(&reason));
+            save(host, &s)?;
+            return Err(reason);
+        }
         match s.state.as_str() {
             "quoted" => {
                 preflight(
@@ -671,9 +797,18 @@ fn refresh_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
         if s.terminal() {
             return Ok(());
         }
-        if s.outbox_id.is_some() && s.origin_tx_hash.is_none() {
-            inspect_outbox(host, &mut s)?;
-            s = load(host, wallet, id)?;
+        // Upstream keys its status by deposit address, so it answers about that
+        // address whether or not this session ever funded it. Polling before an
+        // origin transaction exists therefore lets an unrelated answer drive
+        // this session's state machine, and the terminal settled states it maps
+        // to would strand a swap the owner has not yet executed. Learn the hash
+        // from the owned outbox entry when there is one, and otherwise leave
+        // the session where confirm can still advance it.
+        if s.origin_tx_hash.is_none() {
+            if s.outbox_id.is_some() {
+                inspect_outbox(host, &mut s)?;
+                s = load(host, wallet, id)?;
+            }
             if s.origin_tx_hash.is_none() {
                 s.last_error = None;
                 save(host, &s)?;
@@ -688,7 +823,7 @@ fn refresh_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
             save(host, &s)?;
             match api::submit(
                 host,
-                &jwt,
+                jwt.as_ref(),
                 &hash,
                 s.quote.quote.deposit_address.as_deref().unwrap(),
             ) {
@@ -706,7 +841,7 @@ fn refresh_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
         }
         let (status, raw) = match api::status(
             host,
-            &jwt,
+            jwt.as_ref(),
             s.quote.quote.deposit_address.as_deref().unwrap(),
         ) {
             Ok(value) => value,
@@ -793,6 +928,18 @@ pub fn abandon<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<(), Stri
         {
             return Err("cannot abandon after an outbox transaction exists".into());
         }
+        // The staging marker means an outbox entry may exist that this session
+        // never recorded an ID for, so `outbox_id` being empty proves nothing.
+        // Confirm already refuses to restage on this evidence; abandoning would
+        // instead close the session as "abandoned before deposit" and leave
+        // that entry orphaned behind a record saying it cannot exist.
+        if s.staging_started || matches!(s.state.as_str(), "staging_started" | "staging_ambiguous")
+        {
+            return Err(
+                "cannot abandon while a staged outbox entry may exist; reconcile the outbox first"
+                    .into(),
+            );
+        }
         s.transition(host.now_ms(), "abandoned", "user abandoned before deposit");
         save(host, &s)
     })();
@@ -820,11 +967,15 @@ mod workflow_tests {
         confirm_calls: usize,
         submit_calls: usize,
         quote_calls: usize,
+        http_calls: usize,
+        quote_authorized: Option<bool>,
         status_calls: usize,
         erc20: bool,
         stage_fails: bool,
         corrupt_signature: bool,
         response_insured: Option<bool>,
+        response_amount_in_usd: Option<String>,
+        response_fees: Option<(Option<String>, Option<String>)>,
         response_app_fees: Option<Vec<crate::api_types::AppFee>>,
         inspect_pending: bool,
         malformed_status: bool,
@@ -853,8 +1004,10 @@ mod workflow_tests {
         quote_signature::verify_with_key(q, &key).map_err(|e| e.to_string())
     }
 
-    fn signed_quote(req: QuoteRequest) -> QuoteResponse {
-        let mut q = QuoteResponse {
+    /// A validly signed quote whose `amountInUsd` is whatever the venue chose
+    /// to report, so a test can sign a value the policy should refuse.
+    fn signed_quote(req: QuoteRequest, amount_in_usd: &str) -> QuoteResponse {
+        let q = QuoteResponse {
             correlation_id: "mock-correlation".into(),
             timestamp: "2027-01-15T08:00:00Z".into(),
             signature: String::new(),
@@ -865,7 +1018,7 @@ mod workflow_tests {
                 chain_deposit_addresses: None,
                 amount_in: req.amount.clone(),
                 amount_in_formatted: "0.000000000000001".into(),
-                amount_in_usd: "0.01".into(),
+                amount_in_usd: amount_in_usd.into(),
                 min_amount_in: req.amount.clone(),
                 amount_out: "2000".into(),
                 amount_out_formatted: "0.002".into(),
@@ -881,6 +1034,11 @@ mod workflow_tests {
                 withdraw_fee: Some("2".into()),
             },
         };
+        resign(q)
+    }
+
+    /// Sign a quote as the venue would, after a test has changed a field.
+    fn resign(mut q: QuoteResponse) -> QuoteResponse {
         let hash = quote_signature::quote_hash(&q).unwrap();
         q.signature = format!(
             "ed25519:{}",
@@ -900,6 +1058,7 @@ mod workflow_tests {
             Ok(Some("https://mock.invalid".into()))
         }
         fn http(&mut self, req: HttpRequest, _: usize) -> Result<HttpResponse, String> {
+            self.0.borrow_mut().http_calls += 1;
             let path = url::Url::parse(&req.url).unwrap().path().to_string();
             let body = match (req.method.as_str(), path.as_str()) {
                 ("GET", "/v0/tokens") => {
@@ -912,16 +1071,30 @@ mod workflow_tests {
                 }
                 ("POST", "/v0/quote") => {
                     self.0.borrow_mut().quote_calls += 1;
+                    let sent = req
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k == "authorization")
+                        .map(|(_, v)| v.clone());
+                    // Either the partner credential, or no header at all: a
+                    // malformed one must never reach the venue.
                     assert!(
-                        req.headers
-                            .iter()
-                            .any(|(k, v)| k == "authorization" && v == &format!("Bearer {JWT}"))
+                        sent.is_none() || sent.as_deref() == Some(&format!("Bearer {JWT}")),
+                        "unexpected authorization header: {sent:?}"
                     );
+                    self.0.borrow_mut().quote_authorized = Some(sent.is_some());
                     let request_json: serde_json::Value =
                         serde_json::from_slice(&req.body).unwrap();
                     self.0.borrow_mut().quote_request_json = Some(request_json.clone());
                     let request: QuoteRequest = serde_json::from_value(request_json).unwrap();
-                    let mut quote = signed_quote(request);
+                    let reported_usd = self.0.borrow().response_amount_in_usd.clone();
+                    let mut quote =
+                        signed_quote(request, reported_usd.as_deref().unwrap_or("0.01"));
+                    if let Some((refund, withdraw)) = self.0.borrow().response_fees.clone() {
+                        quote.quote.refund_fee = refund;
+                        quote.quote.withdraw_fee = withdraw;
+                        quote = resign(quote);
+                    }
                     quote.quote_request.insured = self.0.borrow().response_insured;
                     quote.quote_request.app_fees = self.0.borrow().response_app_fees.clone();
                     if self.0.borrow().corrupt_signature {
@@ -1126,7 +1299,7 @@ mod workflow_tests {
         drop(host);
         let mut restarted = MockHost(shared.clone());
         assert!(credential_status(&mut restarted).unwrap().configured);
-        let request = serde_json::json!({"session_id":"test-e2e-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":"recipient-on-destination","deadline_seconds":900});
+        let request = serde_json::json!({"session_id":"test-e2e-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":WALLET,"deadline_seconds":900});
         let id = create_with_verifier(
             &mut restarted,
             "alice",
@@ -1213,7 +1386,7 @@ mod workflow_tests {
 
     #[test]
     fn accepts_upstream_insured_false_but_rejects_true() {
-        let request = serde_json::json!({"session_id":"test-insured-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":"recipient-on-destination","deadline_seconds":900});
+        let request = serde_json::json!({"session_id":"test-insured-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":WALLET,"deadline_seconds":900});
 
         for (insured, succeeds) in [(false, true), (true, false)] {
             let shared = Rc::new(RefCell::new(Shared {
@@ -1248,7 +1421,7 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let request = serde_json::json!({"session_id":"test-limit-order-fee","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":"recipient-on-destination","deadline_seconds":900});
+        let request = serde_json::json!({"session_id":"test-limit-order-fee","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"nep141:sol.omft.near","amount":"1000","recipient":WALLET,"deadline_seconds":900});
 
         let id = create_with_verifier(
             &mut host,
@@ -1316,7 +1489,7 @@ mod workflow_tests {
             "origin_asset":"nep141:eth.omft.near",
             "destination_asset":"dest",
             "amount":"1000",
-            "recipient":"recipient",
+            "recipient":WALLET,
             "deadline_seconds":900
         }))
         .unwrap();
@@ -1336,6 +1509,319 @@ mod workflow_tests {
         assert_eq!(shared.status_calls, 0);
     }
 
+    fn swap_body(session: &str, recipient: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "session_id": session,
+            "swap_type": "EXACT_INPUT",
+            "origin_asset": "nep141:eth.omft.near",
+            "destination_asset": "dest",
+            "amount": "1000",
+            "recipient": recipient,
+            "deadline_seconds": 900
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_wallet_without_a_credential_still_swaps_unauthenticated() {
+        // 1Click serves unauthenticated callers at a higher platform fee, so a
+        // missing key is a cost, not a gate. The session records which path it
+        // took so the owner sees it before approving.
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = create_with_verifier(
+            &mut host,
+            "alice",
+            &swap_body("no-credential", WALLET),
+            test_verify,
+        )
+        .unwrap();
+        assert_eq!(shared.borrow().quote_calls, 1);
+        assert_eq!(shared.borrow().quote_authorized, Some(false));
+        let session = load(&mut host, "alice", &id).unwrap();
+        assert_eq!(session.quote_authenticated, Some(false));
+    }
+
+    #[test]
+    fn a_configured_credential_is_still_sent() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let id = create_with_verifier(
+            &mut host,
+            "alice",
+            &swap_body("with-credential", WALLET),
+            test_verify,
+        )
+        .unwrap();
+        assert_eq!(shared.borrow().quote_authorized, Some(true));
+        let session = load(&mut host, "alice", &id).unwrap();
+        assert_eq!(session.quote_authenticated, Some(true));
+    }
+
+    #[test]
+    fn venue_policy_refuses_a_foreign_recipient_before_quoting() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let elsewhere = "0x9999999999999999999999999999999999999999";
+        let error = create_with_verifier(
+            &mut host,
+            "alice",
+            &swap_body("foreign-recipient", elsewhere),
+            test_verify,
+        )
+        .unwrap_err();
+        assert!(error.contains("recipients.allowed"), "{error}");
+        // Nothing was asked of the venue, so a refused swap costs no quote.
+        assert_eq!(shared.borrow().quote_calls, 0);
+    }
+
+    #[test]
+    fn a_wallet_can_allow_its_custodians_address() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let treasury = "0x9999999999999999999999999999999999999999";
+        crate::policy::write(
+            &mut host,
+            "alice",
+            format!("[recipients]\nallowed = [\"{treasury}\"]\n").as_bytes(),
+        )
+        .unwrap();
+        let id = create_with_verifier(
+            &mut host,
+            "alice",
+            &swap_body("custodian-recipient", treasury),
+            test_verify,
+        )
+        .unwrap();
+        let session = load(&mut host, "alice", &id).unwrap();
+        assert_eq!(session.quote.quote_request.recipient, treasury);
+        let checks = session.policy_checks.expect("checks are stored");
+        assert!(crate::policy::deny_reason(&checks).is_none());
+        // The wallet's own address is no longer allowed, because the class was
+        // replaced rather than added to.
+        assert!(
+            create_with_verifier(
+                &mut host,
+                "alice",
+                &swap_body("self-recipient", WALLET),
+                test_verify
+            )
+            .unwrap_err()
+            .contains("recipients.allowed")
+        );
+    }
+
+    #[test]
+    fn a_policy_tightened_after_quoting_stops_the_confirm() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let id = create_with_verifier(
+            &mut host,
+            "alice",
+            &swap_body("tightened-session", WALLET),
+            test_verify,
+        )
+        .unwrap();
+        crate::policy::write(&mut host, "alice", b"[venue]\nenabled = false\n").unwrap();
+        let error =
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap_err();
+        assert!(error.contains("venue.enabled"), "{error}");
+        assert_eq!(load(&mut host, "alice", &id).unwrap().state, "quoted");
+        assert_eq!(shared.borrow().stage_calls, 0);
+    }
+
+    #[test]
+    fn a_spend_cap_refuses_a_swap_the_venue_values_above_it() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        // The mock quote values the input at 0.01 USD.
+        crate::policy::write(&mut host, "alice", b"[limits]\nmax_input_usd = \"0.005\"\n").unwrap();
+        let error = create_with_verifier(
+            &mut host,
+            "alice",
+            &swap_body("capped-session", WALLET),
+            test_verify,
+        )
+        .unwrap_err();
+        assert!(error.contains("limits.input_usd"), "{error}");
+        // A cap above the quote lets the same swap through.
+        crate::policy::write(&mut host, "alice", b"[limits]\nmax_input_usd = \"1\"\n").unwrap();
+        create_with_verifier(
+            &mut host,
+            "alice",
+            &swap_body("uncapped-session", WALLET),
+            test_verify,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_confirm_denied_by_a_tightened_policy_records_the_denial() {
+        // The stored checks are the record of why a confirm was refused.
+        // Returning the denial without saving would leave policy_check.json
+        // and the plan showing the passing result from the quote.
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let id = create_with_verifier(
+            &mut host,
+            "alice",
+            &swap_body("tightened-session", WALLET),
+            test_verify,
+        )
+        .unwrap();
+        let quoted = load(&mut host, "alice", &id).unwrap();
+        assert!(
+            crate::policy::deny_reason(quoted.policy_checks.as_ref().unwrap()).is_none(),
+            "the quote should have passed"
+        );
+
+        crate::policy::write(&mut host, "alice", b"[limits]\nmax_input_usd = \"0.005\"\n").unwrap();
+        let error =
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap_err();
+        assert!(error.contains("limits.input_usd"), "{error}");
+
+        let denied = load(&mut host, "alice", &id).unwrap();
+        let checks = denied.policy_checks.as_ref().expect("checks persisted");
+        assert!(
+            crate::policy::deny_reason(checks).is_some_and(|r| r.contains("limits.input_usd")),
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_amount_or_body_is_refused_before_any_venue_request() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+
+        // 79 digits is past uint256, and so is the largest 78-digit string.
+        for amount in ["1".repeat(79), "9".repeat(78), "1".repeat(1_000_000)] {
+            let body = serde_json::to_vec(&serde_json::json!({"session_id":"overlong-amount-01","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":amount,"recipient":WALLET})).unwrap();
+            if body.len() > crate::input::MAX_SWAP_REQUEST_BYTES {
+                let error =
+                    create_with_verifier(&mut host, "alice", &body, test_verify).unwrap_err();
+                assert!(error.contains("the limit is"), "{error}");
+            } else {
+                let error =
+                    create_with_verifier(&mut host, "alice", &body, test_verify).unwrap_err();
+                assert!(error.contains("positive canonical integer"), "{error}");
+            }
+        }
+        assert_eq!(shared.borrow().http_calls, 0, "no token or quote request");
+        assert!(
+            !shared
+                .borrow()
+                .store
+                .keys()
+                .any(|k| k.contains("overlong-amount-01")),
+            "nothing persisted"
+        );
+    }
+
+    #[test]
+    fn a_signed_quote_with_an_unreadable_usd_value_is_refused_even_without_a_cap() {
+        // The quote is validly signed, so the signature check cannot be what
+        // stops it, and the wallet sets no USD cap. The value is stored and
+        // shown to the owner, so an unreadable one must still end the swap.
+        for reported in ["1e999", "-5", "lots", "5."] {
+            let shared = Rc::new(RefCell::new(Shared {
+                response_amount_in_usd: Some(reported.into()),
+                ..Shared::default()
+            }));
+            let mut host = MockHost(shared.clone());
+            write_api_key(&mut host, JWT.as_bytes()).unwrap();
+            crate::policy::write(&mut host, "alice", b"[limits]\nmax_slippage_bps = 100\n")
+                .unwrap();
+            assert!(
+                crate::policy::load(&mut host, "alice")
+                    .unwrap()
+                    .limits
+                    .max_input_usd
+                    .is_none()
+            );
+
+            let error = create_with_verifier(
+                &mut host,
+                "alice",
+                &swap_body("unreadable-usd-value", WALLET),
+                test_verify,
+            )
+            .unwrap_err();
+            assert!(error.contains("limits.input_usd"), "{reported}: {error}");
+            assert_eq!(shared.borrow().quote_calls, 1, "the quote was requested");
+            assert_eq!(shared.borrow().stage_calls, 0, "nothing was staged");
+            let quoted = load(&mut host, "alice", "unreadable-usd-value")
+                .map(|session| session.state == "quoted")
+                .unwrap_or(false);
+            assert!(!quoted, "{reported}: no quoted session may exist");
+        }
+    }
+
+    #[test]
+    fn a_signed_quote_with_an_unreadable_fee_is_refused_and_zero_or_absent_fees_pass() {
+        let attempt = |refund: Option<&str>, withdraw: Option<&str>| {
+            let shared = Rc::new(RefCell::new(Shared {
+                response_fees: Some((refund.map(str::to_owned), withdraw.map(str::to_owned))),
+                ..Shared::default()
+            }));
+            let mut host = MockHost(shared.clone());
+            write_api_key(&mut host, JWT.as_bytes()).unwrap();
+            let result = create_with_verifier(
+                &mut host,
+                "alice",
+                &swap_body("fee-validation-1", WALLET),
+                test_verify,
+            );
+            let staged = shared.borrow().stage_calls;
+            (result, staged)
+        };
+        let overlong = "1".repeat(79);
+        for bad in ["1e999", "-5", "lots", "1.5", "007", " 5", overlong.as_str()] {
+            let (result, staged) = attempt(Some(bad), Some("2"));
+            let error = result.unwrap_err();
+            assert!(error.contains("refundFee"), "{bad}: {error}");
+            assert_eq!(staged, 0);
+            let (result, _) = attempt(Some("1"), Some(bad));
+            assert!(result.unwrap_err().contains("withdrawFee"), "{bad}");
+        }
+        // A free withdrawal or refund is a real quote, and a venue may omit
+        // either fee entirely.
+        for (refund, withdraw) in [
+            (Some("0"), Some("0")),
+            (None, None),
+            (Some("1200000000000"), Some("5300")),
+        ] {
+            let (result, _) = attempt(refund, withdraw);
+            assert!(result.is_ok(), "{refund:?}/{withdraw:?}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn a_damaged_policy_file_fails_closed() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        shared.borrow_mut().store.insert(
+            crate::policy::venue_policy_key("alice"),
+            b"[limits]\nmax_slippage_bps = \"lots\"\n".to_vec(),
+        );
+        let error = create_with_verifier(
+            &mut host,
+            "alice",
+            &swap_body("damaged-policy", WALLET),
+            test_verify,
+        )
+        .unwrap_err();
+        assert!(error.contains("venue.toml is invalid"), "{error}");
+        assert_eq!(shared.borrow().quote_calls, 0);
+    }
+
     #[test]
     fn erc20_workflow_prepares_transfer_to_validated_contract() {
         let shared = Rc::new(RefCell::new(Shared {
@@ -1344,7 +1830,7 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared);
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"test-erc20-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"test-erc20-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":WALLET,"deadline_seconds":900})).unwrap();
         let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
         confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
         let tx = load(&mut host, "alice", &id)
@@ -1364,7 +1850,7 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"test-ambiguous-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"test-ambiguous-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":WALLET,"deadline_seconds":900})).unwrap();
         let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
         confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
         assert!(confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).is_err());
@@ -1384,7 +1870,7 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared);
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"test-failure-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"test-failure-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":WALLET,"deadline_seconds":900})).unwrap();
         assert!(create_with_verifier(&mut host, "alice", &body, test_verify).is_err());
         let id = "test-failure-session";
         let raw = host
@@ -1401,7 +1887,7 @@ mod workflow_tests {
         let shared = Rc::new(RefCell::new(Shared::default()));
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"caller-known-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"caller-known-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":WALLET,"deadline_seconds":900})).unwrap();
         assert_eq!(
             create_with_verifier(&mut host, "alice", &body, test_verify).unwrap(),
             "caller-known-session"
@@ -1419,7 +1905,7 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"pending-outbox-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"pending-outbox-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":WALLET,"deadline_seconds":900})).unwrap();
         let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
         confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
         confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
@@ -1439,7 +1925,7 @@ mod workflow_tests {
         }));
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"status-error-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"status-error-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":WALLET,"deadline_seconds":900})).unwrap();
         let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
         for _ in 0..3 {
             confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
@@ -1456,7 +1942,7 @@ mod workflow_tests {
         let shared = Rc::new(RefCell::new(Shared::default()));
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"session_id":"migrated-sent-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient","deadline_seconds":900})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"session_id":"migrated-sent-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":WALLET,"deadline_seconds":900})).unwrap();
         let id = create_with_verifier(&mut host, "alice", &body, test_verify).unwrap();
         for _ in 0..3 {
             confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
@@ -1477,7 +1963,7 @@ mod workflow_tests {
     }
     fn bound_session(host: &mut MockHost) -> String {
         write_api_key(host, JWT.as_bytes()).unwrap();
-        let request = serde_json::json!({"session_id":"bound-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient"});
+        let request = serde_json::json!({"session_id":"bound-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":WALLET});
         create_with_verifier(
             host,
             "alice",
@@ -1625,7 +2111,7 @@ mod workflow_tests {
         shared.borrow_mut().selected_wallet = Some("bob".into());
         let mut host = MockHost(shared.clone());
         write_api_key(&mut host, JWT.as_bytes()).unwrap();
-        let request = serde_json::json!({"session_id":"bob-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient"});
+        let request = serde_json::json!({"session_id":"bob-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":WALLET});
         let id = create_with_verifier(
             &mut host,
             "bob",
@@ -1680,7 +2166,7 @@ mod workflow_tests {
 
     #[test]
     fn request_cannot_select_another_account() {
-        let request = serde_json::json!({"session_id":"bound-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":"recipient"});
+        let request = serde_json::json!({"session_id":"bound-session","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth.omft.near","destination_asset":"dest","amount":"1000","recipient":WALLET});
         for (key, value) in [
             ("account", serde_json::json!(7)),
             ("account_fingerprint", serde_json::json!("aa".repeat(32))),
@@ -1689,6 +2175,96 @@ mod workflow_tests {
             let mut input = request.clone();
             input[key] = value;
             assert!(serde_json::from_value::<NewSwapRequest>(input).is_err());
+        }
+    }
+
+    #[test]
+    fn a_lock_left_unreadable_by_a_crashed_write_is_reclaimed_rather_than_wedging_the_session() {
+        // `put-new` creates the key before it flushes the body, so a write that
+        // dies in between leaves a lock that exists but cannot be parsed. Every
+        // session operation takes this lock first, so refusing to reclaim it
+        // would make the session permanently unusable.
+        for debris in [Vec::new(), b"{".to_vec(), b"null".to_vec()] {
+            let shared = Rc::new(RefCell::new(Shared::default()));
+            let mut host = MockHost(shared.clone());
+            let id = bound_session(&mut host);
+            shared
+                .borrow_mut()
+                .store
+                .insert(format!("locks/swaps/alice/{id}"), debris);
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+            assert_eq!(load(&mut host, "alice", &id).unwrap().state, "prepared");
+        }
+    }
+
+    #[test]
+    fn a_live_lock_is_still_refused_while_it_holds() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        let held = serde_json::json!({"owner":"someone-else","expires_ms":u64::MAX}).to_string();
+        shared
+            .borrow_mut()
+            .store
+            .insert(format!("locks/swaps/alice/{id}"), held.into_bytes());
+        assert!(confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).is_err());
+        assert_eq!(shared.borrow().stage_calls, 0);
+    }
+
+    #[test]
+    fn abandoning_is_refused_while_a_staged_outbox_entry_may_exist() {
+        let shared = Rc::new(RefCell::new(Shared {
+            stage_fails: true,
+            ..Shared::default()
+        }));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        assert!(confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).is_err());
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "staging_ambiguous"
+        );
+        assert!(
+            abandon(&mut host, "alice", &id)
+                .unwrap_err()
+                .contains("reconcile the outbox first")
+        );
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "staging_ambiguous"
+        );
+    }
+
+    #[test]
+    fn a_quoted_swap_can_still_be_abandoned() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared);
+        let id = bound_session(&mut host);
+        abandon(&mut host, "alice", &id).unwrap();
+        assert_eq!(load(&mut host, "alice", &id).unwrap().state, "abandoned");
+    }
+
+    #[test]
+    fn refresh_does_not_poll_upstream_before_the_deposit_has_an_origin_transaction() {
+        // Upstream answers about the deposit address, not about this session,
+        // so a swap the owner has only quoted or prepared must not be moved to
+        // a settled state by it and left unconfirmable. Once an outbox entry
+        // exists the hash comes from that entry first, which
+        // `refresh_does_not_poll_upstream_before_outbox_has_a_hash` covers.
+        for transitions in 0..=1 {
+            let shared = Rc::new(RefCell::new(Shared::default()));
+            let mut host = MockHost(shared.clone());
+            let id = bound_session(&mut host);
+            for _ in 0..transitions {
+                confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+            }
+            let before = load(&mut host, "alice", &id).unwrap().state;
+            refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).unwrap();
+            assert_eq!(shared.borrow().status_calls, 0, "{before}");
+            let session = load(&mut host, "alice", &id).unwrap();
+            assert!(!session.terminal(), "{before} became {}", session.state);
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
         }
     }
 }

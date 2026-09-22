@@ -25,10 +25,26 @@ jobs:
       - name: Install component tools
         run: cargo install wasm-tools --version 1.249.0 --locked
       - name: Install canonical Petal toolchain
-        run: cargo install --git https://github.com/bloom-directory/petal --rev 1af3ba971e8b494b58bb85d0c0fcf2ad15cd3b4c --locked bloom-petal-cli
+        run: cargo install --git https://github.com/bloom-directory/petal --rev 2beed2ff344ce2b0c112e07096027e1ae0404007 --locked bloom-petal-cli
       - name: Build and inspect all routes
+        shell: bash
         run: |
+          set -euo pipefail
           scripts/build.sh
           petal check --root .
-          test "$(find petal/near-intents -name '*.wasm' | wc -l | tr -d ' ')" = 24
-          ! rg -n 'bloom:sign/signing@' < <(find petal/near-intents -name '*.wasm' -print0 | xargs -0 -n1 wasm-tools component wit)
+          # Read the routes into an array first: an empty find leaves zero
+          # entries and fails the count below rather than silently checking
+          # nothing.
+          mapfile -t routes < <(find petal/near-intents -name '*.wasm')
+          test "${#routes[@]}" = 27
+          # Dump each component's WIT with a plain loop. A pipeline or a
+          # process substitution would hide a `wasm-tools` failure, leaving
+          # grep with empty input — and `! grep` on empty input succeeds, so
+          # the guard would pass while guarding nothing.
+          wit="${RUNNER_TEMP:-/tmp}/routes.wit"
+          : > "$wit"
+          for route in "${routes[@]}"; do
+            wasm-tools component wit "$route" >> "$wit"
+          done
+          test -s "$wit"
+          ! grep -n 'bloom:sign/signing@' "$wit"

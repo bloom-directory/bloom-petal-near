@@ -27,6 +27,23 @@ Never run a live-money swap without explicit user authorization.
   `scripts/check-route-architecture.sh`, route tests and Clippy,
   `scripts/build.sh`, and `petal check --root .`.
 
+## Venue policy
+
+- Each wallet's swap rules live at `settings/wallets/<wallet>/venue.toml`, in
+  `route/src/policy.rs`, with the bundled defaults in
+  `route/src/venue-defaults.toml`. A wallet without a file uses those defaults.
+- Enforce the policy before the quote request, again against the signed quote,
+  and again at confirmation. Store the resulting checks on the session so
+  `plan.md` and `policy_check.json` show what held.
+- A stored file that no longer parses fails closed. Never fall back to the
+  defaults for a policy the owner wrote.
+- These rules are guard rails, not custody: anything that can write the mount
+  can change them. Bloom's wallet policy and the per-transaction approval remain
+  the checks that matter, so never describe the venue policy as an authority
+  boundary.
+- Do not add a rule the Petal cannot verify from what it sees. The 1Click quote
+  carries no solver identity, so solver filtering is not implementable today.
+
 ## Wallets and transactions
 
 - The package is wallet-scoped and supports account 0. Resolve wallet route

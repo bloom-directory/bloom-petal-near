@@ -15,6 +15,6 @@ jobs:
       petal-name: near-intents
       petal-tooling-ref: "2beed2ff344ce2b0c112e07096027e1ae0404007"
       build-command: scripts/build.sh
-      expected-route-count: 24
+      expected-route-count: 27
     secrets:
       compile-time-secret: ${{ secrets.NEAR_INTENTS_PARTNER_JWT }}
