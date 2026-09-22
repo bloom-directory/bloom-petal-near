@@ -48,6 +48,13 @@ pub fn canonical_amount(value: &str) -> bool {
         && alloy::primitives::U256::from_str_radix(value, 10).is_ok()
 }
 
+/// A venue-reported fee in an asset's smallest units. Unlike a swap amount a
+/// fee may be zero, but it is still shown to the owner before approval, so it
+/// has to be a plain bounded integer.
+pub fn canonical_fee(value: &str) -> bool {
+    value == "0" || canonical_amount(value)
+}
+
 fn safe(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
 }

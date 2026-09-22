@@ -211,6 +211,18 @@ fn validate_echo(
             return Err(format!("quote {name} is not a positive integer"));
         }
     }
+    // Fees do not feed the transaction, but the plan shows them to the owner
+    // at the moment of approval, so an unreadable one ends the swap too.
+    for (name, value) in [
+        ("refundFee", &q.refund_fee),
+        ("withdrawFee", &q.withdraw_fee),
+    ] {
+        if let Some(value) = value
+            && !crate::input::canonical_fee(value)
+        {
+            return Err(format!("quote {name} is not a non-negative integer"));
+        }
+    }
     let u = |v: &str| {
         alloy::primitives::U256::from_str_radix(v, 10)
             .map_err(|_| "quote amount exceeds uint256".to_string())
@@ -963,6 +975,7 @@ mod workflow_tests {
         corrupt_signature: bool,
         response_insured: Option<bool>,
         response_amount_in_usd: Option<String>,
+        response_fees: Option<(Option<String>, Option<String>)>,
         response_app_fees: Option<Vec<crate::api_types::AppFee>>,
         inspect_pending: bool,
         malformed_status: bool,
@@ -994,7 +1007,7 @@ mod workflow_tests {
     /// A validly signed quote whose `amountInUsd` is whatever the venue chose
     /// to report, so a test can sign a value the policy should refuse.
     fn signed_quote(req: QuoteRequest, amount_in_usd: &str) -> QuoteResponse {
-        let mut q = QuoteResponse {
+        let q = QuoteResponse {
             correlation_id: "mock-correlation".into(),
             timestamp: "2027-01-15T08:00:00Z".into(),
             signature: String::new(),
@@ -1021,6 +1034,11 @@ mod workflow_tests {
                 withdraw_fee: Some("2".into()),
             },
         };
+        resign(q)
+    }
+
+    /// Sign a quote as the venue would, after a test has changed a field.
+    fn resign(mut q: QuoteResponse) -> QuoteResponse {
         let hash = quote_signature::quote_hash(&q).unwrap();
         q.signature = format!(
             "ed25519:{}",
@@ -1072,6 +1090,11 @@ mod workflow_tests {
                     let reported_usd = self.0.borrow().response_amount_in_usd.clone();
                     let mut quote =
                         signed_quote(request, reported_usd.as_deref().unwrap_or("0.01"));
+                    if let Some((refund, withdraw)) = self.0.borrow().response_fees.clone() {
+                        quote.quote.refund_fee = refund;
+                        quote.quote.withdraw_fee = withdraw;
+                        quote = resign(quote);
+                    }
                     quote.quote_request.insured = self.0.borrow().response_insured;
                     quote.quote_request.app_fees = self.0.borrow().response_app_fees.clone();
                     if self.0.borrow().corrupt_signature {
@@ -1737,6 +1760,45 @@ mod workflow_tests {
                 .map(|session| session.state == "quoted")
                 .unwrap_or(false);
             assert!(!quoted, "{reported}: no quoted session may exist");
+        }
+    }
+
+    #[test]
+    fn a_signed_quote_with_an_unreadable_fee_is_refused_and_zero_or_absent_fees_pass() {
+        let attempt = |refund: Option<&str>, withdraw: Option<&str>| {
+            let shared = Rc::new(RefCell::new(Shared {
+                response_fees: Some((refund.map(str::to_owned), withdraw.map(str::to_owned))),
+                ..Shared::default()
+            }));
+            let mut host = MockHost(shared.clone());
+            write_api_key(&mut host, JWT.as_bytes()).unwrap();
+            let result = create_with_verifier(
+                &mut host,
+                "alice",
+                &swap_body("fee-validation-1", WALLET),
+                test_verify,
+            );
+            let staged = shared.borrow().stage_calls;
+            (result, staged)
+        };
+        let overlong = "1".repeat(79);
+        for bad in ["1e999", "-5", "lots", "1.5", "007", " 5", overlong.as_str()] {
+            let (result, staged) = attempt(Some(bad), Some("2"));
+            let error = result.unwrap_err();
+            assert!(error.contains("refundFee"), "{bad}: {error}");
+            assert_eq!(staged, 0);
+            let (result, _) = attempt(Some("1"), Some(bad));
+            assert!(result.unwrap_err().contains("withdrawFee"), "{bad}");
+        }
+        // A free withdrawal or refund is a real quote, and a venue may omit
+        // either fee entirely.
+        for (refund, withdraw) in [
+            (Some("0"), Some("0")),
+            (None, None),
+            (Some("1200000000000"), Some("5300")),
+        ] {
+            let (result, _) = attempt(refund, withdraw);
+            assert!(result.is_ok(), "{refund:?}/{withdraw:?}: {result:?}");
         }
     }
 
