@@ -20,7 +20,7 @@ BLOOM_BIN=/path/to/bloom scripts/e2e-cli.sh
 ```
 
 After installation, write the 1Click partner JWT once to
-`/petals/near-intents/settings/api-key`. It is stored in Bloom's persistent
+`/petals/near-intents/wallets/<wallet>/<account>/settings/api-key`. It is stored in Bloom's persistent
 private store. Reads return configuration status only and never echo the key.
 
 The implementation contract and security invariants are in
@@ -53,19 +53,19 @@ references immutable and update them together when changing release machinery.
 
 ## Wallets and transactions
 
-Swaps use **account 0** of the wallet selected by the route. Supported origins
+Swaps use the **selected account** of the wallet selected by the route. Supported origins
 are EVM chains; Solana addresses can be used as destination recipients.
 
 Wallet paths:
 
-- EVM address: `/wallets/<wallet>/0/address.evm`.
-- EVM native balance: `/wallets/<wallet>/0/chains/<chain>/balance.raw`.
-- Outbox staging: `/wallets/<wallet>/0/chains/<chain>/outbox/new.tx`.
-- Outbox entries: `/wallets/<wallet>/0/chains/<chain>/outbox/<pending|sent|failed>/<id>/`.
+- EVM address: `/wallets/<wallet>/<account>/address.evm`.
+- EVM native balance: `/wallets/<wallet>/<account>/chains/<chain>/balance.raw`.
+- Outbox staging: `/wallets/<wallet>/<account>/chains/<chain>/outbox/new.tx`.
+- Outbox entries: `/wallets/<wallet>/<account>/chains/<chain>/outbox/<pending|sent|failed>/<id>/`.
 - Solana recipient discovery: direct `address`, `balance`, and `balance.json`
-  leaves under `/wallets/<wallet>/0/chains/<solana-chain>/`.
+  leaves under `/wallets/<wallet>/<account>/chains/<solana-chain>/`.
 
-Each session records the selected wallet's account-0 address and checks it before
+Each session records the selected wallet's account address and checks it before
 subsequent operations. Before confirmation or inspection, the Petal verifies the
 sender and deposit bytes in the session's exact outbox entry. Bloom handles
 Broker authorization, simulation, policy, signing, and broadcast through its
@@ -75,3 +75,7 @@ After an ambiguous confirmation, retry `confirm` or `refresh` to inspect the sam
 outbox entry. The Petal never automatically rebroadcasts it. If inspection remains
 pending without a hash, use Bloom's reconciliation and approval surfaces; do not
 create another swap to work around the ambiguity.
+
+## Account-scoped routes
+
+Select a wallet and numbered account under `/petals/near-intents/wallets/<wallet>/<account>/`. Petal operations and settings live below that directory. Account 0 keeps its existing private records; other accounts have separate stores. The core wallet tree remains `/wallets/<wallet>/<account>/`.
