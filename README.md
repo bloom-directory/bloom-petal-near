@@ -16,12 +16,15 @@ cargo test --manifest-path route/Cargo.toml
 scripts/build.sh
 BLOOM_REPO=/path/to/bloom scripts/validate.sh
 # Or run the installed WASM package with synthetic accounts in the VM fixture:
-BLOOM_REPO=/path/to/revised-bloom scripts/e2e-cli.sh
+BLOOM_REPO=/path/to/bloom scripts/e2e-cli.sh
 ```
 
+Use a Bloom checkout supporting explicit wallet/index routes and exact
+`[store].shared_keys` declarations for the WASM fixture.
+
 After installation, write the 1Click partner JWT once to
-`/petals/near-intents/settings/<wallet>/<index>/api-key`. It is stored in Bloom's persistent
-private store. Reads return configuration status only and never echo the key.
+`/petals/near-intents/settings/api-key`. It is stored in Bloom's persistent
+package-global secret store shared by all accounts. Reads return configuration status only and never echo the key.
 
 The implementation contract and security invariants are in
 [`docs/2026-07-14-near-intents-petal-design.md`](docs/2026-07-14-near-intents-petal-design.md).
@@ -83,7 +86,7 @@ create another swap to work around the ambiguity.
 
 ## Account-scoped routes
 
-Operations use `/petals/near-intents/swaps/<wallet>/<index>/`; credentials use `/petals/near-intents/settings/<wallet>/<index>/`. Bloom resolves the explicit adjacent wallet and canonical numbered index from its live authenticated account projection, then supplies trusted `bloom.wallet` and `bloom.account`. Every index, including 0, has a uniform private store. Public metadata and documentation remain unscoped. Old packages and custom packages require a separate update; no legacy account-0 storage or old-host fallback is supported. The core wallet tree remains `/wallets/<wallet>/<index>/`.
+Operations use `/petals/near-intents/swaps/<wallet>/<index>/`; service credentials use the global `/petals/near-intents/settings/` routes. Bloom resolves the explicit adjacent wallet and canonical numbered index from its live authenticated account projection, then supplies trusted `bloom.wallet` and `bloom.account`. Every index, including 0, has a uniform private store for account state. The manifest shares only the exact service credential keys through the package-global store. Public metadata and documentation remain unscoped. Old packages and custom packages require a separate update; no legacy account-0 storage or old-host fallback is supported. The core wallet tree remains `/wallets/<wallet>/<index>/`.
 
 Existing installed state must be retained through the storage cutover. Pending
 sessions contain exact outbox and settlement correlation data needed for manual

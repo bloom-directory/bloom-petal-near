@@ -31,6 +31,6 @@ fi
 if [ -n "$BLOOM_REPO" ]; then
   BLOOM_REPO="$BLOOM_REPO" "$ROOT/scripts/e2e-cli.sh"
 else
-  echo "set BLOOM_REPO=/path/to/revised-bloom to validate the installed WASM package" >&2
+  echo "set BLOOM_REPO=/path/to/bloom to validate the installed WASM package" >&2
   exit 127
 fi
