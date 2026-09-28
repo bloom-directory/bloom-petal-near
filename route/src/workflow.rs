@@ -1767,6 +1767,16 @@ mod workflow_tests {
     }
 
     #[test]
+    fn latest_record_with_maximum_route_segments_fits_the_read_limit() {
+        let wallet = "w".repeat(64);
+        let id = "i".repeat(64);
+        let raw = serde_json::to_vec(&serde_json::json!({"id": id})).unwrap();
+        let projected = project_latest(&wallet, u32::MAX, &raw).unwrap();
+        assert!(projected.len() > 128);
+        assert!(projected.len() <= 512);
+    }
+
+    #[test]
     fn account_one_uses_numbered_address_balance_and_outbox() {
         let shared = Rc::new(RefCell::new(Shared::default()));
         shared.borrow_mut().selected_account = 1;

@@ -11,8 +11,8 @@ at `settings/<wallet>/<index>/{api-key,status.json}`. Public `tokens.json` and
 rewrite is used. Bloom matches the captures against its live authenticated
 account projection and supplies trusted `bloom.wallet` and `bloom.account`.
 The request body cannot select or override an account. Missing trusted context
-is rejected before quote creation. Parent routes list the canonical core wallet
-and numbered-account directories.
+is rejected before quote creation. Bloom synthesizes parent directory children from the authenticated core wallet
+and numbered-account projections; guests need no broad wallet-listing authority.
 
 Canonical identity is `wallets/<wallet>/<index>/address.evm`; balance and exact
 outbox artifacts live under that account's `chains/<chain>/`. Sessions persist
