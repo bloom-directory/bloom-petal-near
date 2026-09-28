@@ -302,7 +302,7 @@ explicitly reviewed design adds a separate trust-root configuration.
 Expose:
 
 ```text
-/petals/near-intents/settings/<wallet>/<index>/api-key
+/petals/near-intents/settings/api-key
 ```
 
 Writes accept either a raw non-whitespace JWT or:
@@ -388,8 +388,8 @@ upgrade; implicit secret migration is forbidden.
 |---|---|---|
 | `meta/route-contract.json` | read | Static machine-readable route and capability contract |
 | `tokens.json` | read | Fetch current 1Click tokens, filter/annotate executable Bloom origins, cache briefly |
-| `settings/<wallet>/<index>/api-key` | read/write | Report configured state or persist the JWT without echoing it |
-| `settings/<wallet>/<index>/status.json` | read | Report credential presence, endpoint binding, and supported origin mappings |
+| `settings/api-key` | read/write | Report configured state or persist the JWT without echoing it |
+| `settings/status.json` | read | Report credential presence, endpoint binding, and supported origin mappings |
 | `swaps/<wallet>/<index>/new` | read/write | Show input schema or synchronously create the caller-named quote session |
 | `swaps/<wallet>/<index>/latest` | read | Convenience pointer only; agents must use their caller-supplied session ID |
 | `request.json` | read | Canonical user request plus derived origin/refund fields |
@@ -961,7 +961,7 @@ route dispatcher.
 - Undeclared hosts, methods, paths, and redirects are denied.
 - Public VFS sweep proves no JWT, bearer header, raw secret-store path, or
   unredacted upstream credential appears.
-- `settings/<wallet>/<index>/api-key` remains non-readable after write.
+- `settings/api-key` remains non-readable after write.
 - Built artifacts are WASM components, not core WASM modules.
 
 ### 21.4 Live acceptance

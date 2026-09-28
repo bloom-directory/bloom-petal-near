@@ -6,7 +6,7 @@ adjacent `[wallet]/[index]` route captures and uniform private account storage.
 Old hosts and unmodified custom packages are incompatible with this contract.
 
 Operations live at `swaps/<wallet>/<index>/{new,latest,<id>/...}` and credentials
-at `settings/<wallet>/<index>/{api-key,status.json}`. Public `tokens.json` and
+at global `settings/{api-key,status.json}`. The exact partner JWT secret key is shared through the package-global store for all accounts. Public `tokens.json` and
 `meta/` remain unscoped. No `[account] aware` manifest switch or global route-root
 rewrite is used. Bloom matches the captures against its live authenticated
 account projection and supplies trusted `bloom.wallet` and `bloom.account`.
