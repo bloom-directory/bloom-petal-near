@@ -81,8 +81,9 @@ fn wallet_details(wallet: &str) -> Result<(), String> {
     {
         return Err("wallet name is invalid".into());
     }
-    // The numbered EVM address leaf is the compatible authority check. The
-    // retired wallet-root `kind` leaf is unavailable on current Bloom hosts.
+    // Identity is read from the authenticated numbered-account projection before
+    // staging. Address syntax alone does not prove signing authority; the host
+    // outbox enforces authorization for the selected account.
     Ok(())
 }
 
@@ -292,21 +293,12 @@ fn preflight<H: Host>(
     Ok(())
 }
 
-fn swap_link(wallet: &str, id: &str, route_prefix: Option<&str>) -> String {
-    match route_prefix {
-        Some(prefix) => format!("{prefix}swaps/{id}"),
-        None => format!("swaps/{wallet}/{id}"),
-    }
+fn swap_link(wallet: &str, account: u32, id: &str) -> String {
+    format!("swaps/{wallet}/{account}/{id}")
 }
 
-/// Stored `latest` records from the old route contain an unnumbered path.
-/// Derive the presentation link from the trusted current route context while
-/// keeping the durable record and its account-zero key unchanged.
-pub fn project_latest(
-    wallet: &str,
-    raw: &[u8],
-    route_prefix: Option<&str>,
-) -> Result<Vec<u8>, String> {
+/// Derive the presentation link from the trusted current account context.
+pub fn project_latest(wallet: &str, account: u32, raw: &[u8]) -> Result<Vec<u8>, String> {
     let mut latest: serde_json::Value =
         serde_json::from_slice(raw).map_err(|e| format!("invalid latest swap: {e}"))?;
     let id = latest
@@ -320,23 +312,22 @@ pub fn project_latest(
     {
         return Err("latest swap has invalid id".into());
     }
-    let path = swap_link(wallet, id, route_prefix);
+    let path = swap_link(wallet, account, id);
     latest["path"] = serde_json::Value::String(path);
     serde_json::to_vec(&latest).map_err(|e| e.to_string())
 }
 
 pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String, String> {
-    create_for_account(host, wallet, 0, None, body)
+    create_for_account(host, wallet, 0, body)
 }
 
 pub fn create_for_account<H: Host>(
     host: &mut H,
     wallet: &str,
     account: u32,
-    route_prefix: Option<&str>,
     body: &[u8],
 ) -> Result<String, String> {
-    create_with_verifier_for_account(host, wallet, account, route_prefix, body, |quote| {
+    create_with_verifier_for_account(host, wallet, account, body, |quote| {
         quote_signature::verify(quote).map_err(|e| e.to_string())
     })
 }
@@ -348,14 +339,13 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
     body: &[u8],
     verifier: V,
 ) -> Result<String, String> {
-    create_with_verifier_for_account(host, wallet, 0, None, body, verifier)
+    create_with_verifier_for_account(host, wallet, 0, body, verifier)
 }
 
 fn create_with_verifier_for_account<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>>(
     host: &mut H,
     wallet: &str,
     account_number: u32,
-    route_prefix: Option<&str>,
     body: &[u8],
     verifier: V,
 ) -> Result<String, String> {
@@ -468,7 +458,7 @@ fn create_with_verifier_for_account<H: Host, V: Fn(&QuoteResponse) -> Result<Str
         host.put(
             &format!("swaps/{wallet}/latest"),
             serde_json::to_string(
-                &serde_json::json!({"id":id,"path":swap_link(wallet, &id, route_prefix)}),
+                &serde_json::json!({"id":id,"path":swap_link(wallet, account_number, &id)}),
             )
             .unwrap()
             .as_bytes(),
@@ -492,7 +482,7 @@ fn create_with_verifier_for_account<H: Host, V: Fn(&QuoteResponse) -> Result<Str
             false,
         );
         let latest = serde_json::to_vec(
-            &serde_json::json!({"id":id,"path":swap_link(wallet, &id, route_prefix)}),
+            &serde_json::json!({"id":id,"path":swap_link(wallet, account_number, &id)}),
         )
         .unwrap();
         let _ = host.put(&format!("swaps/{wallet}/latest"), &latest, false);
@@ -1716,6 +1706,27 @@ mod workflow_tests {
     }
 
     #[test]
+    fn missing_account_identity_blocks_preparation_and_staging() {
+        for prepare_first in [false, true] {
+            let shared = Rc::new(RefCell::new(Shared::default()));
+            let mut host = MockHost(shared.clone());
+            let id = bound_session(&mut host);
+            if prepare_first {
+                confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+            }
+            shared.borrow_mut().missing_zero_address = true;
+            assert!(
+                confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify)
+                    .unwrap_err()
+                    .contains("zero address missing")
+            );
+            assert_eq!(shared.borrow().stage_calls, 0);
+            assert_eq!(shared.borrow().confirm_calls, 0);
+            assert_eq!(shared.borrow().submit_calls, 0);
+        }
+    }
+
+    #[test]
     fn a_session_rebound_to_another_account_is_rejected_before_outbox() {
         let shared = Rc::new(RefCell::new(Shared::default()));
         let mut host = MockHost(shared.clone());
@@ -1739,24 +1750,20 @@ mod workflow_tests {
     }
 
     #[test]
-    fn emitted_swap_path_preserves_legacy_and_scoped_spellings() {
-        assert_eq!(swap_link("alice", "x", None), "swaps/alice/x");
-        assert_eq!(
-            swap_link("alice", "x", Some("wallets/alice/1/")),
-            "wallets/alice/1/swaps/x"
-        );
+    fn emitted_swap_path_includes_wallet_and_numbered_account() {
+        assert_eq!(swap_link("alice", 0, "x"), "swaps/alice/0/x");
+        assert_eq!(swap_link("alice", 1, "x"), "swaps/alice/1/x");
     }
 
     #[test]
-    fn old_latest_record_projects_to_current_scoped_route() {
-        let old = br#"{"id":"account-zero","path":"swaps/alice/account-zero"}"#;
-        let projected = project_latest("alice", old, Some("wallets/alice/0/")).unwrap();
-        let doc: serde_json::Value = serde_json::from_slice(&projected).unwrap();
-        assert_eq!(doc["id"], "account-zero");
-        assert_eq!(doc["path"], "wallets/alice/0/swaps/account-zero");
-        let legacy: serde_json::Value =
-            serde_json::from_slice(&project_latest("alice", old, None).unwrap()).unwrap();
-        assert_eq!(legacy["path"], "swaps/alice/account-zero");
+    fn latest_record_projects_to_selected_account_route() {
+        let raw = br#"{"id":"account-zero","path":"obsolete"}"#;
+        for account in [0, 1] {
+            let projected = project_latest("alice", account, raw).unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&projected).unwrap();
+            assert_eq!(doc["id"], "account-zero");
+            assert_eq!(doc["path"], format!("swaps/alice/{account}/account-zero"));
+        }
     }
 
     #[test]
@@ -1770,7 +1777,6 @@ mod workflow_tests {
             &mut host,
             "alice",
             1,
-            Some("wallets/alice/1/"),
             &serde_json::to_vec(&request).unwrap(),
             test_verify,
         )

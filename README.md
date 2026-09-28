@@ -15,12 +15,12 @@ repository does not carry a private WIT, SDK, or builder copy.
 cargo test --manifest-path route/Cargo.toml
 scripts/build.sh
 BLOOM_REPO=/path/to/bloom scripts/validate.sh
-# Or run the isolated daemon/package smoke test with an already built binary:
-BLOOM_BIN=/path/to/bloom scripts/e2e-cli.sh
+# Or run the installed WASM package with synthetic accounts in the VM fixture:
+BLOOM_REPO=/path/to/revised-bloom scripts/e2e-cli.sh
 ```
 
 After installation, write the 1Click partner JWT once to
-`/petals/near-intents/wallets/<wallet>/<account>/settings/api-key`. It is stored in Bloom's persistent
+`/petals/near-intents/settings/<wallet>/<index>/api-key`. It is stored in Bloom's persistent
 private store. Reads return configuration status only and never echo the key.
 
 The implementation contract and security invariants are in
@@ -78,4 +78,10 @@ create another swap to work around the ambiguity.
 
 ## Account-scoped routes
 
-Select a wallet and numbered account under `/petals/near-intents/wallets/<wallet>/<account>/`. Petal operations and settings live below that directory. Account 0 keeps its existing private records; other accounts have separate stores. The core wallet tree remains `/wallets/<wallet>/<account>/`.
+Operations use `/petals/near-intents/swaps/<wallet>/<index>/`; credentials use `/petals/near-intents/settings/<wallet>/<index>/`. Bloom resolves the explicit adjacent wallet and canonical numbered index from its live authenticated account projection, then supplies trusted `bloom.wallet` and `bloom.account`. Every index, including 0, has a uniform private store. Public metadata and documentation remain unscoped. Old packages and custom packages require a separate update; no legacy account-0 storage or old-host fallback is supported. The core wallet tree remains `/wallets/<wallet>/<index>/`.
+
+Existing installed state must be retained through the storage cutover. Pending
+sessions contain exact outbox and settlement correlation data needed for manual
+reconciliation. This package does not migrate or remove that state. Inspect
+pending sessions before replacing an installation; automatic recovery across
+the old storage layout is unsupported.

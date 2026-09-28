@@ -30,6 +30,3 @@ paths = ["/v0/quote", "/v0/deposit/submit"]
 [store]
 namespaces = ["state"]
 secret_namespaces = ["secrets"]
-
-[account]
-aware = true

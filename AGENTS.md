@@ -43,4 +43,4 @@ Never run a live-money swap without explicit user authorization.
 
 ## Account-scoped routes
 
-Select a wallet and numbered account under `/petals/near-intents/wallets/<wallet>/<account>/`. Petal operations and settings live below that directory. Account 0 keeps its existing private records; other accounts have separate stores. The core wallet tree remains `/wallets/<wallet>/<account>/`.
+Operations use `/petals/near-intents/swaps/<wallet>/<index>/`; credentials use `/petals/near-intents/settings/<wallet>/<index>/`. Bloom resolves the explicit adjacent wallet and canonical numbered index from its live authenticated account projection, then supplies trusted `bloom.wallet` and `bloom.account`. Every index, including 0, has a uniform private store. Public metadata and documentation remain unscoped. Old packages and custom packages require a separate update; no legacy account-0 storage or old-host fallback is supported. The core wallet tree remains `/wallets/<wallet>/<index>/`.

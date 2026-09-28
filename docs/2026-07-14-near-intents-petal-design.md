@@ -5,10 +5,10 @@
 **Target:** `bloom-petal-near`
 **Bloom compatibility:** Petal package v1, `bloom:route@0.1.0`
 
-**v0.3 migration amendment:** [Wallet-scoped account-0 paths and validation](bloom-v0.3-migration.md)
+**v0.3 migration amendment:** [Explicit numbered-account paths and validation](bloom-v0.3-migration.md)
 supersede the original wallet identity and confirmation-retry assumptions below.
-Only account 0 within the selected wallet is supported; account awareness is
-reserved for a future change.
+Explicit wallet/index routes select numbered accounts from the live authenticated
+account projection; request bodies cannot choose an account.
 
 ## 1. Decision
 
@@ -302,7 +302,7 @@ explicitly reviewed design adds a separate trust-root configuration.
 Expose:
 
 ```text
-/petals/near-intents/settings/api-key
+/petals/near-intents/settings/<wallet>/<index>/api-key
 ```
 
 Writes accept either a raw non-whitespace JWT or:
@@ -388,10 +388,10 @@ upgrade; implicit secret migration is forbidden.
 |---|---|---|
 | `meta/route-contract.json` | read | Static machine-readable route and capability contract |
 | `tokens.json` | read | Fetch current 1Click tokens, filter/annotate executable Bloom origins, cache briefly |
-| `settings/api-key` | read/write | Report configured state or persist the JWT without echoing it |
-| `settings/status.json` | read | Report credential presence, endpoint binding, and supported origin mappings |
-| `swaps/<wallet>/new` | read/write | Show input schema or synchronously create the caller-named quote session |
-| `swaps/<wallet>/latest` | read | Convenience pointer only; agents must use their caller-supplied session ID |
+| `settings/<wallet>/<index>/api-key` | read/write | Report configured state or persist the JWT without echoing it |
+| `settings/<wallet>/<index>/status.json` | read | Report credential presence, endpoint binding, and supported origin mappings |
+| `swaps/<wallet>/<index>/new` | read/write | Show input schema or synchronously create the caller-named quote session |
+| `swaps/<wallet>/<index>/latest` | read | Convenience pointer only; agents must use their caller-supplied session ID |
 | `request.json` | read | Canonical user request plus derived origin/refund fields |
 | `quote.json` | read | Redacted complete quote, signature, verification result, and hash |
 | `review_intent.json` | read | Stable machine-readable action reviewed by the user |
@@ -412,7 +412,7 @@ racing `latest` or guessing whether an asynchronous job finished.
 
 ## 9. User input
 
-`swaps/<wallet>/new` accepts:
+`swaps/<wallet>/<index>/new` accepts:
 
 ```json
 {
@@ -448,10 +448,11 @@ Rules:
   1. Arbitrary refund addresses are rejected to prevent accidental or hostile
   diversion.
 
-The route obtains the wallet address through mediated VFS read. A watch-only
-wallet may create dry/local review state but cannot advance to an executable
-outbox deposit. In version 1, `new` requests an executable `dry: false` quote;
-if the wallet cannot transact, creation fails before making that request.
+The route obtains the selected numbered account address through mediated VFS
+read. Current Bloom hosts expose authenticated key projections rather than the
+legacy watch-wallet surface. A missing account projection blocks quote creation,
+preparation, and staging. Address syntax alone does not prove signing authority;
+the host outbox enforces authorization. No wallet-root `kind` leaf is used.
 
 ## 10. Origin-chain and asset resolution
 
@@ -726,7 +727,8 @@ claims destination success based only on the origin EVM receipt.
 
 Store one JSON session record in the `state` namespace at:
 
-`swaps/<wallet>/<id>/session.json`
+`swaps/<wallet>/<id>/session.json` within the host-selected private
+wallet/index namespace (including index 0)
 
 Large raw upstream responses may be stored separately under the same prefix.
 The public routes render allowlisted projections rather than returning private
@@ -955,7 +957,7 @@ route dispatcher.
 - Undeclared hosts, methods, paths, and redirects are denied.
 - Public VFS sweep proves no JWT, bearer header, raw secret-store path, or
   unredacted upstream credential appears.
-- `settings/api-key` remains non-readable after write.
+- `settings/<wallet>/<index>/api-key` remains non-readable after write.
 - Built artifacts are WASM components, not core WASM modules.
 
 ### 21.4 Live acceptance
