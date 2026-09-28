@@ -65,6 +65,11 @@ Wallet paths:
 - Solana recipient discovery: direct `address`, `balance`, and `balance.json`
   leaves under `/wallets/<wallet>/<account>/chains/<solana-chain>/`.
 
+Before requesting a new executable quote, the Petal requires a matching live
+`account.json` projection with an active EVM state and present EVM KeyRef.
+Retired, missing, and address-only identities are refused before upstream work.
+This lifecycle/key-presence preflight does not grant signing approval.
+
 Each session records the selected wallet's account address and checks it before
 subsequent operations. Before confirmation or inspection, the Petal verifies the
 sender and deposit bytes in the session's exact outbox entry. Bloom handles

@@ -17,6 +17,12 @@ and numbered-account projections; guests need no broad wallet-listing authority.
 Canonical identity is `wallets/<wallet>/<index>/address.evm`; balance and exact
 outbox artifacts live under that account's `chains/<chain>/`. Sessions persist
 the selected account number and address and revalidate them before side effects.
+Before any upstream request for a new executable quote, the Petal checks
+`wallets/<wallet>/<index>/account.json` for the matching numbered identity,
+`evm.state = "active"`, and a present EVM KeyRef. Retired, missing, and
+address-only projections are refused even when `address.evm` exists. This is
+a lifecycle/key-presence preflight, not signing approval.
+
 Address syntax alone is not proof of signing authority. The host transaction
 outbox owns Broker authorization, simulation, policy, signing, and broadcast.
 No wallet-root `kind` leaf is used. Missing account identity never falls back

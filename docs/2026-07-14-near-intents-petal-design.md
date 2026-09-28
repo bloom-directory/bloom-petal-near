@@ -450,8 +450,12 @@ Rules:
 
 The route obtains the selected numbered account address through mediated VFS
 read. Current Bloom hosts expose authenticated key projections rather than the
-legacy watch-wallet surface. A missing account projection blocks quote creation,
-preparation, and staging. Address syntax alone does not prove signing authority;
+legacy watch-wallet surface. New executable quotes require a matching live `account.json` projection with
+`evm.state = "active"` and a present EVM KeyRef before any upstream request.
+Retired, missing, and address-only identities are refused even when an address
+leaf exists. This is a lifecycle/key-presence preflight, not signing approval.
+A missing account projection also blocks preparation and staging. Address syntax
+alone does not prove signing authority;
 the host outbox enforces authorization. No wallet-root `kind` leaf is used.
 
 ## 10. Origin-chain and asset resolution

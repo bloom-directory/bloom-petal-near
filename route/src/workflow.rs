@@ -356,6 +356,7 @@ fn create_with_verifier_for_account<H: Host, V: Fn(&QuoteResponse) -> Result<Str
     let account = crate::accounts::AccountBinding {
         number: account_number,
     };
+    crate::accounts::require_active_evm_key(host, wallet, account_number)?;
     let wallet_address = crate::accounts::address_for_account(host, wallet, account_number)?;
     if req
         .refund_to
@@ -868,6 +869,10 @@ mod workflow_tests {
         confirm_calls: usize,
         submit_calls: usize,
         quote_calls: usize,
+        http_calls: usize,
+        retired_account: bool,
+        address_only_account: bool,
+        missing_account_projection: bool,
         status_calls: usize,
         erc20: bool,
         stage_fails: bool,
@@ -949,6 +954,7 @@ mod workflow_tests {
             Ok(Some("https://mock.invalid".into()))
         }
         fn http(&mut self, req: HttpRequest, _: usize) -> Result<HttpResponse, String> {
+            self.0.borrow_mut().http_calls += 1;
             let path = url::Url::parse(&req.url).unwrap().path().to_string();
             let body = match (req.method.as_str(), path.as_str()) {
                 ("GET", "/v0/tokens") => {
@@ -1057,7 +1063,31 @@ mod workflow_tests {
                 .clone()
                 .unwrap_or_else(|| "alice".into());
             let account = self.0.borrow().selected_account;
-            if path == format!("wallets/{wallet}/{account}/chains/ethereum/balance.raw") {
+            if path == format!("wallets/{wallet}/{account}/account.json") {
+                let shared = self.0.borrow();
+                if shared.missing_account_projection {
+                    return Err("numbered account projection missing".into());
+                }
+                let key_ref = if shared.address_only_account {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!({
+                        "backend":"local", "backend_instance":"fixture",
+                        "locator":format!("wallet/{wallet}/account/{account}"),
+                        "key_spec":"secp256k1", "public_key_fingerprint":"11".repeat(32),
+                        "derivation":null
+                    })
+                };
+                Ok(serde_json::to_vec(&serde_json::json!({
+                    "schema":"bloom.account.v1", "wallet":wallet, "number":account,
+                    "freshness":"fresh", "evm":{
+                        "state":if shared.retired_account { "retired" } else { "active" },
+                        "address":WALLET, "public_key_fingerprint":"11".repeat(32),
+                        "path":format!("m/44'/60'/0'/0/{account}"), "key_ref":key_ref
+                    }, "solana":{"state":"missing"}
+                }))
+                .unwrap())
+            } else if path == format!("wallets/{wallet}/{account}/chains/ethereum/balance.raw") {
                 Ok(b"18446744073709551615\n".to_vec())
             } else if path
                 == format!(
@@ -1691,6 +1721,60 @@ mod workflow_tests {
             load(&mut host, "bob", &id).unwrap().account.unwrap().number,
             0
         );
+    }
+
+    #[test]
+    fn active_account_projection_allows_quote_and_normal_staging() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        assert_eq!(shared.borrow().quote_calls, 1);
+        for _ in 0..2 {
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        }
+        assert_eq!(shared.borrow().stage_calls, 1);
+        assert_eq!(shared.borrow().confirm_calls, 0);
+    }
+
+    #[test]
+    fn non_active_or_address_only_account_is_refused_before_upstream_work() {
+        for rejected in ["retired", "address_only", "missing_projection"] {
+            let shared = Rc::new(RefCell::new(Shared::default()));
+            {
+                let mut state = shared.borrow_mut();
+                state.retired_account = rejected == "retired";
+                state.address_only_account = rejected == "address_only";
+                state.missing_account_projection = rejected == "missing_projection";
+            }
+            let mut host = MockHost(shared.clone());
+            // An address exists in every case: address syntax alone must not
+            // allow a new executable quote or create a session reservation.
+            assert_eq!(
+                crate::accounts::address_for_account(&mut host, "alice", 0).unwrap(),
+                WALLET
+            );
+            write_api_key(&mut host, JWT.as_bytes()).unwrap();
+            let request = serde_json::json!({"session_id":"rejected-account", "swap_type":"EXACT_INPUT", "origin_asset":"nep141:eth.omft.near", "destination_asset":"dest", "amount":"1000", "recipient":"recipient"});
+            assert!(
+                create_with_verifier(
+                    &mut host,
+                    "alice",
+                    &serde_json::to_vec(&request).unwrap(),
+                    test_verify
+                )
+                .is_err(),
+                "{rejected}"
+            );
+            let state = shared.borrow();
+            assert_eq!(state.http_calls, 0, "{rejected}");
+            assert_eq!(state.quote_calls, 0, "{rejected}");
+            assert_eq!(state.stage_calls, 0, "{rejected}");
+            assert_eq!(state.confirm_calls, 0, "{rejected}");
+            assert!(
+                !state.store.keys().any(|key| key.starts_with("swaps/")),
+                "{rejected}"
+            );
+        }
     }
 
     #[test]
