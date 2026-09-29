@@ -29,11 +29,8 @@ if rg -q 'test\.jwt\.must-never-appear' \
 fi
 
 if [ -n "$BLOOM_REPO" ]; then
-  cargo build --manifest-path "$BLOOM_REPO/Cargo.toml" -p bloom --locked
-  BLOOM_BIN="$BLOOM_REPO/target/debug/bloom" "$ROOT/scripts/e2e-cli.sh"
-elif command -v bloom >/dev/null 2>&1; then
-  "$ROOT/scripts/e2e-cli.sh"
+  BLOOM_REPO="$BLOOM_REPO" "$ROOT/scripts/e2e-cli.sh"
 else
-  echo "set BLOOM_REPO=/path/to/bloom or install bloom to validate the package" >&2
+  echo "set BLOOM_REPO=/path/to/bloom to validate the installed WASM package" >&2
   exit 127
 fi

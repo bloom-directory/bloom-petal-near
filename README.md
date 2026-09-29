@@ -15,13 +15,16 @@ repository does not carry a private WIT, SDK, or builder copy.
 cargo test --manifest-path route/Cargo.toml
 scripts/build.sh
 BLOOM_REPO=/path/to/bloom scripts/validate.sh
-# Or run the isolated daemon/package smoke test with an already built binary:
-BLOOM_BIN=/path/to/bloom scripts/e2e-cli.sh
+# Or run the installed WASM package with synthetic accounts in the VM fixture:
+BLOOM_REPO=/path/to/bloom scripts/e2e-cli.sh
 ```
+
+Use a Bloom checkout supporting explicit wallet/index routes and exact
+`[store].shared_keys` declarations for the WASM fixture.
 
 After installation, write the 1Click partner JWT once to
 `/petals/near-intents/settings/api-key`. It is stored in Bloom's persistent
-private store. Reads return configuration status only and never echo the key.
+package-global secret store shared by all accounts. Reads return configuration status only and never echo the key.
 
 The implementation contract and security invariants are in
 [`docs/2026-07-14-near-intents-petal-design.md`](docs/2026-07-14-near-intents-petal-design.md).
@@ -53,19 +56,24 @@ references immutable and update them together when changing release machinery.
 
 ## Wallets and transactions
 
-Swaps use **account 0** of the wallet selected by the route. Supported origins
+Swaps use the **selected account** of the wallet selected by the route. Supported origins
 are EVM chains; Solana addresses can be used as destination recipients.
 
 Wallet paths:
 
-- EVM address: `/wallets/<wallet>/0/address.evm`.
-- EVM native balance: `/wallets/<wallet>/0/chains/<chain>/balance.raw`.
-- Outbox staging: `/wallets/<wallet>/0/chains/<chain>/outbox/new.tx`.
-- Outbox entries: `/wallets/<wallet>/0/chains/<chain>/outbox/<pending|sent|failed>/<id>/`.
+- EVM address: `/wallets/<wallet>/<account>/address.evm`.
+- EVM native balance: `/wallets/<wallet>/<account>/chains/<chain>/balance.raw`.
+- Outbox staging: `/wallets/<wallet>/<account>/chains/<chain>/outbox/new.tx`.
+- Outbox entries: `/wallets/<wallet>/<account>/chains/<chain>/outbox/<pending|sent|failed>/<id>/`.
 - Solana recipient discovery: direct `address`, `balance`, and `balance.json`
-  leaves under `/wallets/<wallet>/0/chains/<solana-chain>/`.
+  leaves under `/wallets/<wallet>/<account>/chains/<solana-chain>/`.
 
-Each session records the selected wallet's account-0 address and checks it before
+Before requesting a new executable quote, the Petal requires a matching live
+`account.json` projection with an active EVM state and present EVM KeyRef.
+Retired, missing, and address-only identities are refused before upstream work.
+This lifecycle/key-presence preflight does not grant signing approval.
+
+Each session records the selected wallet's account address and checks it before
 subsequent operations. Before confirmation or inspection, the Petal verifies the
 sender and deposit bytes in the session's exact outbox entry. Bloom handles
 Broker authorization, simulation, policy, signing, and broadcast through its
@@ -75,3 +83,13 @@ After an ambiguous confirmation, retry `confirm` or `refresh` to inspect the sam
 outbox entry. The Petal never automatically rebroadcasts it. If inspection remains
 pending without a hash, use Bloom's reconciliation and approval surfaces; do not
 create another swap to work around the ambiguity.
+
+## Account-scoped routes
+
+Operations use `/petals/near-intents/swaps/<wallet>/<index>/`; service credentials use the global `/petals/near-intents/settings/` routes. Bloom resolves the explicit adjacent wallet and canonical numbered index from its live authenticated account projection, then supplies trusted `bloom.wallet` and `bloom.account`. Every index, including 0, has a uniform private store for account state. The manifest shares only the exact service credential keys through the package-global store. Public metadata and documentation remain unscoped. Old packages and custom packages require a separate update; no legacy account-0 storage or old-host fallback is supported. The core wallet tree remains `/wallets/<wallet>/<index>/`.
+
+Existing installed state must be retained through the storage cutover. Pending
+sessions contain exact outbox and settlement correlation data needed for manual
+reconciliation. This package does not migrate or remove that state. Inspect
+pending sessions before replacing an installation; automatic recovery across
+the old storage layout is unsupported.
