@@ -211,8 +211,9 @@ fn check_address_entry(field: &str, entry: &str) -> Result<(), String> {
             "{field} entry {entry:?} contains whitespace; addresses are matched literally"
         ));
     }
-    if entry.len() >= CLASS_PREFIX.len()
-        && entry[..CLASS_PREFIX.len()].eq_ignore_ascii_case(CLASS_PREFIX)
+    if entry
+        .get(..CLASS_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(CLASS_PREFIX))
         && entry != WALLET_ADDRESS_CLASS
     {
         return Err(format!(
@@ -621,6 +622,12 @@ fn decimal_at_most(left: &Decimal, right: &Decimal) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_entry_prefix_check_does_not_split_utf8() {
+        assert!(check_address_entry("recipients.allowed", "aaaaaé").is_ok());
+        assert!(check_address_entry("recipients.allowed", "CLASS:typo").is_err());
+    }
 
     fn context<'a>(recipient: &'a str, wallet: &'a str) -> SwapContext<'a> {
         SwapContext {
