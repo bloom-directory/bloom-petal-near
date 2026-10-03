@@ -1,4 +1,4 @@
-//! The venue policy: this Petal's own per-wallet rules for a swap.
+//! The venue policy: this Petal's own per-account rules for a swap.
 //!
 //! These rules are guard rails the Petal enforces before it quotes, stages, or
 //! confirms anything. They are not custody: Bloom's wallet policy decides which
@@ -247,22 +247,6 @@ pub fn write<H: crate::runtime::Host>(
 ) -> Result<(), String> {
     parse(body)?;
     host.put(&venue_policy_key(wallet), body, false)
-}
-
-/// Wallets with a stored policy, for the settings directory listing.
-pub fn configured_wallets<H: crate::runtime::Host>(host: &mut H) -> Result<Vec<String>, String> {
-    let keys = host.list("settings/wallets/", 1024)?;
-    let mut wallets: Vec<String> = keys
-        .iter()
-        .filter_map(|key| {
-            let rest = key.strip_prefix("settings/wallets/")?;
-            let (wallet, leaf) = rest.split_once('/')?;
-            (leaf == "venue.toml" && !wallet.is_empty()).then(|| wallet.to_owned())
-        })
-        .collect();
-    wallets.sort();
-    wallets.dedup();
-    Ok(wallets)
 }
 
 /// What a swap asks for, as far as the venue policy is concerned.

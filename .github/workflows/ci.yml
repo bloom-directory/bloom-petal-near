@@ -36,7 +36,7 @@ jobs:
           # entries and fails the count below rather than silently checking
           # nothing.
           mapfile -t routes < <(find petal/near-intents -name '*.wasm')
-          test "${#routes[@]}" = 27
+          test "${#routes[@]}" = 29
           # Dump each component's WIT with a plain loop. A pipeline or a
           # process substitution would hide a `wasm-tools` failure, leaving
           # grep with empty input — and `! grep` on empty input succeeds, so

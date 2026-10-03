@@ -29,7 +29,7 @@ Never run a live-money swap without explicit user authorization.
 
 ## Venue policy
 
-- Each wallet's swap rules live at `settings/wallets/<wallet>/venue.toml`, in
+- Each account's swap rules live at `settings/wallets/<wallet>/<index>/venue.toml`, in
   `route/src/policy.rs`, with the bundled defaults in
   `route/src/venue-defaults.toml`. A wallet without a file uses those defaults.
 - Enforce the policy before the quote request, again against the signed quote,
@@ -46,14 +46,18 @@ Never run a live-money swap without explicit user authorization.
 
 ## Wallets and transactions
 
-- The package is wallet-scoped and supports account 0. Resolve wallet route
+- The package is wallet-scoped and supports numbered accounts. Resolve wallet route
   parameters with the canonical `petal::wallet_param(ctx)` helper.
-- Read EVM identity from `wallets/<wallet>/0/address.evm`. Chain leaves and outbox
-  artifacts are under `wallets/<wallet>/0/chains/<chain>/`; Solana address/balance
+- Read EVM identity from `wallets/<wallet>/<account>/address.evm`. Chain leaves and outbox
+  artifacts are under `wallets/<wallet>/<account>/chains/<chain>/`; Solana address/balance
   leaves are direct children of that directory.
-- Preserve the session's account-0 address binding and verify the sender and
+- Preserve the session's account address binding and verify the sender and
   prepared deposit against its exact outbox entry before confirmation or inspection.
 - Never construct reserved `bloom.*` parameters. Keep transaction writes on the
   canonical SDK host imports and preserve Broker-mediated authorization.
 - Persist ambiguity markers before staging and confirmation. Reconcile ambiguous
   broadcasts through the existing outbox entry without automatically rebroadcasting.
+
+## Account-scoped routes
+
+Operations use `/petals/near-intents/swaps/<wallet>/<index>/`; service credentials use the global `/petals/near-intents/settings/` routes. Bloom resolves the explicit adjacent wallet and canonical numbered index from its live authenticated account projection, then supplies trusted `bloom.wallet` and `bloom.account`. Every index, including 0, has a uniform private store for account state. The manifest shares only the exact service credential keys through the package-global store. Public metadata and documentation remain unscoped. Old packages and custom packages require a separate update; no legacy account-0 storage or old-host fallback is supported. The core wallet tree remains `/wallets/<wallet>/<index>/`.

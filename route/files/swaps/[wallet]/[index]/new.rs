@@ -11,8 +11,12 @@ petal::route_file!(
             Ok(value) => value,
             Err(response) => return response,
         };
+        let account = match crate::account_number(ctx) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
         let mut host = crate::workflow::BloomHost;
-        match crate::workflow::create(&mut host, wallet, body) {
+        match crate::workflow::create_for_account(&mut host, wallet, account, body) {
             Ok(_) => petal::DispatchResponse::Write,
             Err(error) => petal::error(-4, crate::redaction::sanitize_message(&error)),
         }

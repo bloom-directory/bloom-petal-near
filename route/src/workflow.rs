@@ -87,7 +87,7 @@ pub fn credential_status<H: Host>(host: &mut H) -> Result<settings::CredentialSt
     Ok(settings::configured_status(private_store.as_deref()))
 }
 
-fn wallet_details<H: Host>(host: &mut H, wallet: &str) -> Result<(), String> {
+fn wallet_details(wallet: &str) -> Result<(), String> {
     if wallet.is_empty()
         || wallet.len() > 128
         || !wallet
@@ -96,13 +96,9 @@ fn wallet_details<H: Host>(host: &mut H, wallet: &str) -> Result<(), String> {
     {
         return Err("wallet name is invalid".into());
     }
-    let kind = String::from_utf8(host.vfs_read(&format!("wallets/{wallet}/kind"), 64)?)
-        .map_err(|_| "wallet kind is not UTF-8")?
-        .trim()
-        .to_string();
-    if kind == "watch" {
-        return Err("watch-only wallets cannot create executable swaps".into());
-    }
+    // Identity is read from the authenticated numbered-account projection before
+    // staging. Address syntax alone does not prove signing authority; the host
+    // outbox enforces authorization for the selected account.
     Ok(())
 }
 
@@ -266,6 +262,7 @@ fn preflight<H: Host>(
     origin: &assets::ResolvedOrigin,
     wallet_id: &str,
     wallet: &str,
+    account: u32,
     amount: &str,
 ) -> Result<(), String> {
     const MIN_GAS_RESERVE_WEI: u64 = 100_000_000_000_000;
@@ -276,7 +273,7 @@ fn preflight<H: Host>(
     }
     let balance = host.vfs_read(
         &format!(
-            "wallets/{wallet_id}/0/chains/{}/balance.raw",
+            "wallets/{wallet_id}/{account}/chains/{}/balance.raw",
             origin.bloom_chain
         ),
         128,
@@ -362,15 +359,59 @@ fn enforce_venue_policy(
     }
 }
 
+fn swap_link(wallet: &str, account: u32, id: &str) -> String {
+    format!("swaps/{wallet}/{account}/{id}")
+}
+
+/// Derive the presentation link from the trusted current account context.
+pub fn project_latest(wallet: &str, account: u32, raw: &[u8]) -> Result<Vec<u8>, String> {
+    let mut latest: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|e| format!("invalid latest swap: {e}"))?;
+    let id = latest
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("latest swap has no id")?;
+    if !(8..=64).contains(&id.len())
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err("latest swap has invalid id".into());
+    }
+    let path = swap_link(wallet, account, id);
+    latest["path"] = serde_json::Value::String(path);
+    serde_json::to_vec(&latest).map_err(|e| e.to_string())
+}
+
 pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String, String> {
-    create_with_verifier(host, wallet, body, |quote| {
+    create_for_account(host, wallet, 0, body)
+}
+
+pub fn create_for_account<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    account: u32,
+    body: &[u8],
+) -> Result<String, String> {
+    create_with_verifier_for_account(host, wallet, account, body, |quote| {
         quote_signature::verify(quote).map_err(|e| e.to_string())
     })
 }
 
+#[cfg(test)]
 fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>>(
     host: &mut H,
     wallet: &str,
+    body: &[u8],
+    verifier: V,
+) -> Result<String, String> {
+    create_with_verifier_for_account(host, wallet, 0, body, verifier)
+}
+
+fn create_with_verifier_for_account<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>>(
+    host: &mut H,
+    wallet: &str,
+    account_number: u32,
     body: &[u8],
     verifier: V,
 ) -> Result<String, String> {
@@ -384,9 +425,12 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
     let req: NewSwapRequest =
         serde_json::from_slice(body).map_err(|e| format!("swap request JSON: {e}"))?;
     req.validate()?;
-    wallet_details(host, wallet)?;
-    let account = crate::accounts::AccountBinding { number: 0 };
-    let wallet_address = crate::accounts::address(host, wallet)?;
+    wallet_details(wallet)?;
+    let account = crate::accounts::AccountBinding {
+        number: account_number,
+    };
+    crate::accounts::require_active_evm_key(host, wallet, account_number)?;
+    let wallet_address = crate::accounts::address_for_account(host, wallet, account_number)?;
     if req
         .refund_to
         .as_deref()
@@ -484,6 +528,7 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
             &origin,
             wallet,
             &wallet_address,
+            account_number,
             &quote.quote.amount_in,
         )?;
         let mut s = Session {
@@ -525,7 +570,7 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
         host.put(
             &format!("swaps/{wallet}/latest"),
             serde_json::to_string(
-                &serde_json::json!({"id":id,"path":format!("swaps/{wallet}/{id}")}),
+                &serde_json::json!({"id":id,"path":swap_link(wallet, account_number, &id)}),
             )
             .unwrap()
             .as_bytes(),
@@ -548,9 +593,10 @@ fn create_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String>
             &json(&failure).unwrap_or_default(),
             false,
         );
-        let latest =
-            serde_json::to_vec(&serde_json::json!({"id":id,"path":format!("swaps/{wallet}/{id}")}))
-                .unwrap();
+        let latest = serde_json::to_vec(
+            &serde_json::json!({"id":id,"path":swap_link(wallet, account_number, &id)}),
+        )
+        .unwrap();
         let _ = host.put(&format!("swaps/{wallet}/latest"), &latest, false);
     }
     let _ = host.delete_if(&lock, &lock_token);
@@ -636,6 +682,7 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
                     &s.origin,
                     &s.wallet,
                     &s.wallet_address,
+                    s.account.as_ref().ok_or("account binding missing")?.number,
                     &s.quote.quote.amount_in,
                 )?;
                 let tx = evm::prepare(
@@ -657,6 +704,7 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
                     &s.origin,
                     &s.wallet,
                     &s.wallet_address,
+                    s.account.as_ref().ok_or("account binding missing")?.number,
                     &s.quote.quote.amount_in,
                 )?;
                 s.staging_started = true;
@@ -706,6 +754,7 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
                     &s.origin,
                     &s.wallet,
                     &s.wallet_address,
+                    s.account.as_ref().ok_or("account binding missing")?.number,
                     &s.quote.quote.amount_in,
                 )?;
                 crate::outbox::verify_owned(host, &s)?;
@@ -969,6 +1018,9 @@ mod workflow_tests {
         quote_calls: usize,
         http_calls: usize,
         quote_authorized: Option<bool>,
+        retired_account: bool,
+        address_only_account: bool,
+        missing_account_projection: bool,
         status_calls: usize,
         erc20: bool,
         stage_fails: bool,
@@ -983,6 +1035,7 @@ mod workflow_tests {
         address_changed: bool,
         missing_zero_address: bool,
         selected_wallet: Option<String>,
+        selected_account: u32,
         confirm_fails: bool,
         approval_required: bool,
         wrong_outbox_sender: bool,
@@ -1180,11 +1233,36 @@ mod workflow_tests {
                 .selected_wallet
                 .clone()
                 .unwrap_or_else(|| "alice".into());
-            if path == format!("wallets/{wallet}/0/chains/ethereum/balance.raw") {
+            let account = self.0.borrow().selected_account;
+            if path == format!("wallets/{wallet}/{account}/account.json") {
+                let shared = self.0.borrow();
+                if shared.missing_account_projection {
+                    return Err("numbered account projection missing".into());
+                }
+                let key_ref = if shared.address_only_account {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!({
+                        "backend":"local", "backend_instance":"fixture",
+                        "locator":format!("wallet/{wallet}/account/{account}"),
+                        "key_spec":"secp256k1", "public_key_fingerprint":"11".repeat(32),
+                        "derivation":null
+                    })
+                };
+                Ok(serde_json::to_vec(&serde_json::json!({
+                    "schema":"bloom.account.v1", "wallet":wallet, "number":account,
+                    "freshness":"fresh", "evm":{
+                        "state":if shared.retired_account { "retired" } else { "active" },
+                        "address":WALLET, "public_key_fingerprint":"11".repeat(32),
+                        "path":format!("m/44'/60'/0'/0/{account}"), "key_ref":key_ref
+                    }, "solana":{"state":"missing"}
+                }))
+                .unwrap())
+            } else if path == format!("wallets/{wallet}/{account}/chains/ethereum/balance.raw") {
                 Ok(b"18446744073709551615\n".to_vec())
             } else if path
                 == format!(
-                    "wallets/{wallet}/0/chains/ethereum/outbox/{}/outbox-1/intent.json",
+                    "wallets/{wallet}/{account}/chains/ethereum/outbox/{}/outbox-1/intent.json",
                     self.0
                         .borrow()
                         .outbox_location
@@ -1195,7 +1273,7 @@ mod workflow_tests {
                 let shared = self.0.borrow();
                 let tx = shared.staged_tx.as_ref().ok_or("no staged transaction")?;
                 Ok(serde_json::to_vec(&serde_json::json!({"id":"outbox-1","wallet":wallet,"chain":"ethereum","chain_id":1,"from":if shared.wrong_outbox_sender { DEPOSIT } else { WALLET },"to":tx.to,"value_wei":tx.value_wei,"data_hex":tx.data_hex})).unwrap())
-            } else if path == format!("wallets/{wallet}/0/address.evm") {
+            } else if path == format!("wallets/{wallet}/{account}/address.evm") {
                 if self.0.borrow().missing_zero_address {
                     return Err("account zero address missing".into());
                 }
@@ -2130,6 +2208,60 @@ mod workflow_tests {
     }
 
     #[test]
+    fn active_account_projection_allows_quote_and_normal_staging() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        assert_eq!(shared.borrow().quote_calls, 1);
+        for _ in 0..2 {
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        }
+        assert_eq!(shared.borrow().stage_calls, 1);
+        assert_eq!(shared.borrow().confirm_calls, 0);
+    }
+
+    #[test]
+    fn non_active_or_address_only_account_is_refused_before_upstream_work() {
+        for rejected in ["retired", "address_only", "missing_projection"] {
+            let shared = Rc::new(RefCell::new(Shared::default()));
+            {
+                let mut state = shared.borrow_mut();
+                state.retired_account = rejected == "retired";
+                state.address_only_account = rejected == "address_only";
+                state.missing_account_projection = rejected == "missing_projection";
+            }
+            let mut host = MockHost(shared.clone());
+            // An address exists in every case: address syntax alone must not
+            // allow a new executable quote or create a session reservation.
+            assert_eq!(
+                crate::accounts::address_for_account(&mut host, "alice", 0).unwrap(),
+                WALLET
+            );
+            write_api_key(&mut host, JWT.as_bytes()).unwrap();
+            let request = serde_json::json!({"session_id":"rejected-account", "swap_type":"EXACT_INPUT", "origin_asset":"nep141:eth.omft.near", "destination_asset":"dest", "amount":"1000", "recipient":"recipient"});
+            assert!(
+                create_with_verifier(
+                    &mut host,
+                    "alice",
+                    &serde_json::to_vec(&request).unwrap(),
+                    test_verify
+                )
+                .is_err(),
+                "{rejected}"
+            );
+            let state = shared.borrow();
+            assert_eq!(state.http_calls, 0, "{rejected}");
+            assert_eq!(state.quote_calls, 0, "{rejected}");
+            assert_eq!(state.stage_calls, 0, "{rejected}");
+            assert_eq!(state.confirm_calls, 0, "{rejected}");
+            assert!(
+                !state.store.keys().any(|key| key.starts_with("swaps/")),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[test]
     fn missing_account_zero_address_never_falls_back_to_wallet_root() {
         let shared = Rc::new(RefCell::new(Shared::default()));
         shared.borrow_mut().missing_zero_address = true;
@@ -2142,7 +2274,28 @@ mod workflow_tests {
     }
 
     #[test]
-    fn nonzero_session_is_rejected_before_any_outbox_operation() {
+    fn missing_account_identity_blocks_preparation_and_staging() {
+        for prepare_first in [false, true] {
+            let shared = Rc::new(RefCell::new(Shared::default()));
+            let mut host = MockHost(shared.clone());
+            let id = bound_session(&mut host);
+            if prepare_first {
+                confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+            }
+            shared.borrow_mut().missing_zero_address = true;
+            assert!(
+                confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify)
+                    .unwrap_err()
+                    .contains("zero address missing")
+            );
+            assert_eq!(shared.borrow().stage_calls, 0);
+            assert_eq!(shared.borrow().confirm_calls, 0);
+            assert_eq!(shared.borrow().submit_calls, 0);
+        }
+    }
+
+    #[test]
+    fn a_session_rebound_to_another_account_is_rejected_before_outbox() {
         let shared = Rc::new(RefCell::new(Shared::default()));
         let mut host = MockHost(shared.clone());
         let id = bound_session(&mut host);
@@ -2152,16 +2305,72 @@ mod workflow_tests {
         assert!(
             confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify)
                 .unwrap_err()
-                .contains("only account 0")
+                .contains("not found")
         );
         assert!(
             refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify)
                 .unwrap_err()
-                .contains("only account 0")
+                .contains("not found")
         );
         assert_eq!(shared.borrow().stage_calls, 0);
         assert_eq!(shared.borrow().confirm_calls, 0);
         assert_eq!(shared.borrow().submit_calls, 0);
+    }
+
+    #[test]
+    fn emitted_swap_path_includes_wallet_and_numbered_account() {
+        assert_eq!(swap_link("alice", 0, "x"), "swaps/alice/0/x");
+        assert_eq!(swap_link("alice", 1, "x"), "swaps/alice/1/x");
+    }
+
+    #[test]
+    fn latest_record_projects_to_selected_account_route() {
+        let raw = br#"{"id":"account-zero","path":"obsolete"}"#;
+        for account in [0, 1] {
+            let projected = project_latest("alice", account, raw).unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&projected).unwrap();
+            assert_eq!(doc["id"], "account-zero");
+            assert_eq!(doc["path"], format!("swaps/alice/{account}/account-zero"));
+        }
+    }
+
+    #[test]
+    fn latest_record_with_maximum_route_segments_fits_the_read_limit() {
+        let wallet = "w".repeat(64);
+        let id = "i".repeat(64);
+        let raw = serde_json::to_vec(&serde_json::json!({"id": id})).unwrap();
+        let projected = project_latest(&wallet, u32::MAX, &raw).unwrap();
+        assert!(projected.len() > 128);
+        assert!(projected.len() <= 512);
+    }
+
+    #[test]
+    fn account_one_uses_numbered_address_balance_and_outbox() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        shared.borrow_mut().selected_account = 1;
+        let mut host = MockHost(shared.clone());
+        write_api_key(&mut host, JWT.as_bytes()).unwrap();
+        let request = serde_json::json!({"session_id":"account-one", "swap_type":"EXACT_INPUT", "origin_asset":"nep141:eth.omft.near", "destination_asset":"dest", "amount":"1000", "recipient":WALLET});
+        let id = create_with_verifier_for_account(
+            &mut host,
+            "alice",
+            1,
+            &serde_json::to_vec(&request).unwrap(),
+            test_verify,
+        )
+        .unwrap();
+        assert_eq!(
+            load(&mut host, "alice", &id)
+                .unwrap()
+                .account
+                .unwrap()
+                .number,
+            1
+        );
+        for _ in 0..3 {
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        }
+        assert_eq!(shared.borrow().stage_calls, 1);
     }
 
     #[test]
