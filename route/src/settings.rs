@@ -2,6 +2,7 @@ use serde::Serialize;
 
 pub const JWT_KEY: &str = "credentials/partner-jwt";
 const EMBEDDED_PARTNER_JWT: Option<&str> = option_env!("NEAR_INTENTS_PARTNER_JWT");
+const UNCONFIGURED: &str = "1Click API key is not configured";
 
 #[derive(Clone)]
 pub struct PartnerJwt(String);
@@ -80,11 +81,32 @@ pub fn resolve_partner_jwt(
             source: CredentialSource::EmbeddedPartner,
         });
     }
-    Err("1Click API key is not configured".into())
+    Err(UNCONFIGURED.into())
 }
 
 pub fn configured_partner_jwt(private_store: Option<&[u8]>) -> Result<ResolvedPartnerJwt, String> {
     resolve_partner_jwt(private_store, EMBEDDED_PARTNER_JWT)
+}
+
+/// The credential to send, if there is one. 1Click serves unauthenticated
+/// callers, charging a higher platform fee, so a wallet without a key still
+/// swaps. A key that is present but unreadable is an error rather than a
+/// silent downgrade to the more expensive path.
+pub fn optional_partner_jwt(
+    private_store: Option<&[u8]>,
+) -> Result<Option<ResolvedPartnerJwt>, String> {
+    optional_partner_jwt_with(private_store, EMBEDDED_PARTNER_JWT)
+}
+
+fn optional_partner_jwt_with(
+    private_store: Option<&[u8]>,
+    embedded: Option<&str>,
+) -> Result<Option<ResolvedPartnerJwt>, String> {
+    match resolve_partner_jwt(private_store, embedded) {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(error) if error == UNCONFIGURED => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn status(private_store: Option<&[u8]>, embedded: Option<&str>) -> CredentialStatus {
@@ -217,5 +239,28 @@ mod tests {
         let public_output = serde_json::to_string(&(private_status, embedded_status)).unwrap();
         assert!(!public_output.contains(malformed_private));
         assert!(!public_output.contains(malformed_embedded));
+    }
+
+    #[test]
+    fn an_absent_credential_is_not_an_error() {
+        assert!(resolve_partner_jwt(None, None).is_err());
+        assert!(optional_partner_jwt_with(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_malformed_stored_credential_is_an_error_not_a_downgrade() {
+        // Falling back to the unauthenticated path here would silently cost
+        // the owner the higher platform fee on every swap.
+        let broken = b"not a jwt\nwith a newline";
+        assert!(optional_partner_jwt_with(Some(broken), None).is_err());
+    }
+
+    #[test]
+    fn a_stored_credential_is_preferred_over_the_embedded_one() {
+        let resolved = optional_partner_jwt_with(Some(b"stored-token"), Some("embedded-token"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.jwt.expose(), "stored-token");
+        assert_eq!(resolved.source, CredentialSource::PrivateStore);
     }
 }

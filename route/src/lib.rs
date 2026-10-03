@@ -5,6 +5,7 @@ pub mod assets;
 pub mod evm;
 pub mod input;
 pub mod outbox;
+pub mod policy;
 pub mod quote_signature;
 pub mod redaction;
 pub mod render;

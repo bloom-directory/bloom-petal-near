@@ -14,6 +14,10 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
             "chain_id_expected": session.origin.expected_chain_id,
             "state": session.state,
             "outbox_state": session.outbox_state,
+            "venue_policy": session
+                .policy_checks
+                .clone()
+                .unwrap_or(serde_json::Value::Array(vec![])),
         })),
         Err(error) => petal::error(-1, error),
     }

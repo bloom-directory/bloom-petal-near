@@ -10,6 +10,14 @@ supersede the original wallet identity and confirmation-retry assumptions below.
 Explicit wallet/index routes select numbered accounts from the live authenticated
 account projection; request bodies cannot choose an account.
 
+**Venue policy amendment (2026-09):** the "any destination asset and recipient
+accepted by 1Click" scope in section 2 is now bounded by a per-wallet venue
+policy at `settings/wallets/<wallet>/venue.toml`, enforced by the Petal before
+quoting, on the signed quote, and at confirmation. By default a wallet pays out
+only to its own address, with slippage capped at 1% and input at $250. The
+README's "Venue policy" section is the reference; it is a guard rail the Petal
+enforces, not custody, and does not change the trust model in section 6.
+
 ## 1. Decision
 
 Build a Bloom Petal package mounted at `/petals/near-intents` that executes
@@ -390,6 +398,8 @@ upgrade; implicit secret migration is forbidden.
 | `tokens.json` | read | Fetch current 1Click tokens, filter/annotate executable Bloom origins, cache briefly |
 | `settings/api-key` | read/write | Report configured state or persist the JWT without echoing it |
 | `settings/status.json` | read | Report credential presence, endpoint binding, and supported origin mappings |
+| `settings/wallets/` | list | Authoritative wallet/account inventory supplied by Bloom |
+| `settings/wallets/<wallet>/<index>/venue.toml` | read/write | The account's venue policy; reads return the stored file or the bundled defaults, writes are validated and fail closed |
 | `swaps/<wallet>/<index>/new` | read/write | Show input schema or synchronously create the caller-named quote session |
 | `swaps/<wallet>/<index>/latest` | read | Convenience pointer only; agents must use their caller-supplied session ID |
 | `request.json` | read | Canonical user request plus derived origin/refund fields |

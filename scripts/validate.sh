@@ -17,12 +17,12 @@ else
   "$ROOT/target/petal-tool/bin/petal" check --root "$ROOT"
 fi
 
-if rg -q 'bloom:sign|allowed_intents' "$ROOT/petal.toml" "$ROOT/route"; then
+if grep -rqsE --exclude-dir=target 'bloom:sign|allowed_intents' "$ROOT/petal.toml" "$ROOT/route"; then
   echo "NEAR Intents package unexpectedly contains the Bloom signing surface" >&2
   exit 1
 fi
 
-if rg -q 'test\.jwt\.must-never-appear' \
+if grep -rqsE 'test\.jwt\.must-never-appear' \
   "$ROOT/README.md" "$ROOT/petal.toml" "$ROOT/petal/near-intents" "$ROOT/artifacts" "$ROOT/route/files"; then
   echo "test credential leaked into a public package artifact" >&2
   exit 1
