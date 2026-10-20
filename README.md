@@ -74,8 +74,11 @@ Retired, missing, and address-only identities are refused before upstream work.
 This lifecycle/key-presence preflight does not grant signing approval.
 
 Each session records the selected wallet's account address and checks it before
-subsequent operations. Before confirmation or inspection, the Petal verifies the
-sender and deposit bytes in the session's exact outbox entry. Bloom handles
+subsequent operations. Before confirmation or inspection, the Petal inspects the
+session's exact outbox entry through Bloom's `tx_inspect` host call, which
+answers only for an entry this package staged from the route's bound account.
+The deposit bytes are those the session prepared and staged itself; Petals
+cannot read outbox entries through the VFS. Bloom handles
 Broker authorization, simulation, policy, signing, and broadcast through its
 canonical transaction host interfaces.
 

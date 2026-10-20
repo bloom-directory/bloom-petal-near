@@ -1,7 +1,7 @@
 # Explicit numbered-account route contract
 
 The package retains the pinned canonical Petal SDK and CLI at
-`2beed2ff344ce2b0c112e07096027e1ae0404007`. The Bloom host must support
+`4fefa736df67fa1ee51aeaa0c749d2f11414257d`. The Bloom host must support
 adjacent `[wallet]/[index]` route captures and uniform private account storage.
 Old hosts and unmodified custom packages are incompatible with this contract.
 

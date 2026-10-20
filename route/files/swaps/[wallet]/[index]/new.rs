@@ -7,16 +7,12 @@ petal::route_file!(
         )
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
-        let wallet = match petal::wallet_param(ctx) {
-            Ok(value) => value,
-            Err(response) => return response,
-        };
-        let account = match crate::account_number(ctx) {
+        let account = match crate::wallet::account(ctx) {
             Ok(value) => value,
             Err(response) => return response,
         };
         let mut host = crate::workflow::BloomHost;
-        match crate::workflow::create_for_account(&mut host, wallet, account, body) {
+        match crate::workflow::create_for_account(&mut host, &account, body) {
             Ok(_) => petal::DispatchResponse::Write,
             Err(error) => petal::error(-4, crate::redaction::sanitize_message(&error)),
         }

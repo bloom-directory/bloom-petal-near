@@ -29,13 +29,20 @@ Never run a live-money swap without explicit user authorization.
 
 ## Wallets and transactions
 
-- The package is wallet-scoped and supports numbered accounts. Resolve wallet route
-  parameters with the canonical `petal::wallet_param(ctx)` helper.
-- Read EVM identity from `wallets/<wallet>/<account>/address.evm`. Chain leaves and outbox
-  artifacts are under `wallets/<wallet>/<account>/chains/<chain>/`; Solana address/balance
-  leaves are direct children of that directory.
-- Preserve the session's account address binding and verify the sender and
-  prepared deposit against its exact outbox entry before confirmation or inspection.
+- The package is wallet-scoped and supports numbered accounts. Routes that act on the
+  account (create, confirm, refresh, abandon, latest) resolve Bloom's trusted selection
+  with `crate::wallet::account(ctx)`, which wraps the SDK's `petal::wallet_account`;
+  read-only session routes use `crate::wallet::param(ctx)`. Both apply the SDK's
+  wallet-name grammar. Domain functions that act on the account take the
+  `petal::WalletAccount` rather than a wallet string and account number.
+- Read EVM identity through `crate::accounts::evm_address`, which uses the SDK's
+  `WalletAccount::address_evm_from` on `wallets/<wallet>/<account>/address.evm`. Chain leaves are under
+  `wallets/<wallet>/<account>/chains/<chain>/`; Solana address/balance leaves are direct
+  children of that directory. Bloom denies Petal VFS access to outboxes.
+- Preserve the session's account address binding and inspect its exact outbox entry
+  through `tx_inspect` before confirmation or inspection. Bloom answers only for an
+  entry this package staged from the route's bound account; the deposit bytes are
+  bound by the outbox ID recorded from the session's own `tx_stage`.
 - Never construct reserved `bloom.*` parameters. Keep transaction writes on the
   canonical SDK host imports and preserve Broker-mediated authorization.
 - Persist ambiguity markers before staging and confirmation. Reconcile ambiguous

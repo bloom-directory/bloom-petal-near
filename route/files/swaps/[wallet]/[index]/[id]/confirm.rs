@@ -7,7 +7,7 @@ petal::route_file!(
         )
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
-        let wallet = match petal::wallet_param(ctx) {
+        let account = match crate::wallet::account(ctx) {
             Ok(value) => value,
             Err(response) => return response,
         };
@@ -16,7 +16,7 @@ petal::route_file!(
             Err(response) => return response,
         };
         let mut host = crate::workflow::BloomHost;
-        match crate::workflow::confirm(&mut host, wallet, id, body) {
+        match crate::workflow::confirm(&mut host, &account, id, body) {
             Ok(()) => petal::DispatchResponse::Write,
             Err(error) => petal::error(-4, crate::redaction::sanitize_message(&error)),
         }

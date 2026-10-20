@@ -1,21 +1,14 @@
-//! Verify the account-scoped public outbox before using the canonical SDK operations.
+//! Inspect the session's own outbox entry through Bloom's package-scoped host call.
 use crate::{runtime::Host, session::Session};
-use serde::Deserialize;
+use petal::sdk::OutboxInspection;
 
-#[derive(Deserialize)]
-struct Intent {
-    id: String,
-    wallet: String,
-    chain: String,
-    chain_id: u64,
-    from: String,
-    to: String,
-    value_wei: String,
-    data_hex: String,
-}
-
-pub fn verify_owned<H: Host>(host: &mut H, session: &Session) -> Result<(), String> {
-    let account = session.account.as_ref().ok_or("account binding missing")?;
+/// Bloom answers `tx_inspect` only for an entry this package staged from the
+/// route's bound account, in whichever state it now is, so a successful
+/// inspection proves ownership and sender. The deposit bytes are bound by the
+/// ID recorded from this session's own `tx_stage` of its prepared transaction;
+/// Bloom does not let a Petal read outbox entries through the VFS.
+pub fn inspect_owned<H: Host>(host: &mut H, session: &Session) -> Result<OutboxInspection, String> {
+    session.account.as_ref().ok_or("account binding missing")?;
     let id = session.outbox_id.as_deref().ok_or("outbox ID missing")?;
     if id.is_empty()
         || id.len() > 128
@@ -25,35 +18,19 @@ pub fn verify_owned<H: Host>(host: &mut H, session: &Session) -> Result<(), Stri
     {
         return Err("invalid outbox ID".into());
     }
-    let tx = session
+    session
         .prepared_transaction
         .as_ref()
         .ok_or("prepared transaction missing")?;
-    // The entry may have moved after an ambiguous broadcast. Never use `latest`.
-    for state in ["pending", "sent", "failed"] {
-        let path = format!(
-            "wallets/{}/{}/chains/{}/outbox/{state}/{id}/intent.json",
-            session.wallet, account.number, session.origin.bloom_chain
-        );
-        let Ok(raw) = host.vfs_read(&path, 256 * 1024) else {
-            continue;
-        };
-        let intent: Intent =
-            serde_json::from_slice(&raw).map_err(|_| "invalid Bloom outbox intent")?;
-        if intent.id != id
-            || intent.wallet != session.wallet
-            || intent.chain != session.origin.bloom_chain
-            || intent.chain_id != session.origin.expected_chain_id
-            || !intent.from.eq_ignore_ascii_case(&session.wallet_address)
-            || !intent.to.eq_ignore_ascii_case(&tx.to)
-            || intent.value_wei != tx.value_wei
-            || !intent.data_hex.eq_ignore_ascii_case(&tx.data_hex)
-        {
-            return Err(
-                "Bloom outbox intent does not match the bound account and prepared deposit".into(),
-            );
-        }
-        return Ok(());
+    let inspection = host
+        .tx_inspect(&session.wallet, &session.origin.bloom_chain, id)
+        .map_err(|error| {
+            format!(
+                "owned outbox entry unavailable in the numbered account; reconcile before retrying: {error}"
+            )
+        })?;
+    if inspection.outbox_id != id {
+        return Err("Bloom outbox inspection named a different entry".into());
     }
-    Err("owned outbox entry unavailable in the numbered account; reconcile before retrying".into())
+    Ok(inspection)
 }

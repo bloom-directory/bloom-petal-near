@@ -11,7 +11,7 @@ pub trait Host {
     fn put(&mut self, key: &str, value: &[u8], secret: bool) -> Result<(), String>;
     fn put_new(&mut self, key: &str, value: &[u8], secret: bool) -> Result<(), String>;
     fn delete_if(&mut self, key: &str, expected: &[u8]) -> Result<(), String>;
-    fn vfs_read(&mut self, path: &str, max: usize) -> Result<Vec<u8>, String>;
+    fn vfs_read(&mut self, path: &str, max: usize) -> Result<Vec<u8>, petal::SdkError>;
     fn chain_read(&mut self, chain: &str, method: &str, params: &str) -> Result<String, String>;
     fn tx_stage(&mut self, tx: &EvmTransaction) -> Result<StagedTransaction, String>;
     fn tx_confirm(
@@ -80,8 +80,8 @@ impl Host for BloomHost {
         petal::sdk::store_del_if_value(key, expected).map_err(|error| error.message())
     }
 
-    fn vfs_read(&mut self, path: &str, max: usize) -> Result<Vec<u8>, String> {
-        petal::sdk::vfs_read(path, max).map_err(|error| error.message())
+    fn vfs_read(&mut self, path: &str, max: usize) -> Result<Vec<u8>, petal::SdkError> {
+        petal::sdk::vfs_read(path, max)
     }
 
     fn chain_read(&mut self, chain: &str, method: &str, params: &str) -> Result<String, String> {
