@@ -2,8 +2,12 @@ petal::route_file!(
     spec: petal::write_spec().caps(&["bloom:store", "bloom:tx.outbox", "bloom:chain", "bloom:vfs.read"]),
     read: |_ctx: &petal::Ctx| {
         petal::DispatchResponse::Read(
-            b"write confirm to advance one durable transition; completion means status.json is durable\n"
-                .to_vec(),
+            b"Write confirm to advance one step; status.json shows the new state.
+1. quoted -> prepared: builds the deposit transaction.
+2. prepared -> staged: stages it in the wallet outbox for the owner to review. Stop here unless the user asked to submit.
+3. staged -> approval_required or deposit_broadcast_pending: asks the owner to approve, then broadcasts.
+"
+            .to_vec(),
         )
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

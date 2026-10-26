@@ -169,7 +169,8 @@ fn validate_echo(
         || r.amount != sent.amount
         || r.refund_to != wallet
         || r.recipient != sent.recipient
-        || r.deadline != sent.deadline
+        // 1Click echoes `.140Z` for a sent `.14Z`; compare instants, not text.
+        || parse_time_ms(&r.deadline)? != parse_time_ms(&sent.deadline)?
         || r.quote_waiting_time_ms != sent.quote_waiting_time_ms
     {
         return Err("quote echoed different execution fields".into());
@@ -1565,6 +1566,21 @@ mod workflow_tests {
             test_verify,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn deadline_echo_compares_instants_not_text() {
+        let mut host = MockHost(Rc::new(RefCell::new(Shared::default())));
+        let id = bound_session(&mut host);
+        let s = load(&mut host, "alice", &id).unwrap();
+        let mut sent = s.quote.quote_request.clone();
+        sent.deadline = iso_deadline(1_792_978_513_140, 900).unwrap();
+        assert_eq!(sent.deadline, "2026-10-26T01:50:13.14Z");
+        let mut got = s.quote.clone();
+        got.quote_request.deadline = "2026-10-26T01:50:13.140Z".into();
+        assert!(validate_echo(&sent, &got, &s.wallet_address, host.now_ms()).is_ok());
+        got.quote_request.deadline = "2026-10-26T01:50:13.141Z".into();
+        assert!(validate_echo(&sent, &got, &s.wallet_address, host.now_ms()).is_err());
     }
 
     #[test]
