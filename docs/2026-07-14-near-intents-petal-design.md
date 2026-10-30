@@ -812,9 +812,12 @@ submit_ambiguous
 abandoned
 ```
 
-No transition from `abandoned` is allowed. `abandon` is rejected after an
-outbox transaction has been confirmed or broadcast because it cannot cancel
-the external transfer.
+No transition from `abandoned` is allowed. `abandon` is rejected while an
+outbox transaction is pending or after it was broadcast, because it cannot
+cancel the external transfer. It is allowed when Bloom moved the owned entry to
+`failed/` with no transaction hash (for example a policy refusal): nothing was
+broadcast and the entry can no longer be confirmed. `confirm` and `refresh`
+move such a session to `deposit_failed`.
 
 ## 18. Idempotency and recovery invariants
 

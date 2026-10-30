@@ -8,7 +8,7 @@ use crate::{
     session::{self, Session},
     settings::{self, PartnerJwt},
 };
-use petal::sdk::EvmTransaction;
+use petal::sdk::{EvmTransaction, OutboxInspection};
 use sha2::{Digest, Sha256};
 
 const MAX_UPSTREAM_APP_FEE_BPS: u32 = 40;
@@ -668,10 +668,19 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
     finish_locked(result, release)
 }
 
-fn inspect_outbox<H: Host>(host: &mut H, s: &mut Session) -> Result<(), String> {
-    crate::outbox::verify_owned(host, s)?;
+/// Inspects the owned outbox entry. The flag is true when Bloom moved the entry
+/// to `failed/` without a transaction hash, for example after a policy refusal:
+/// nothing was broadcast and the entry can no longer be confirmed.
+fn inspect_owned<H: Host>(host: &mut H, s: &Session) -> Result<(OutboxInspection, bool), String> {
+    let location = crate::outbox::verify_owned(host, s)?;
     let id = s.outbox_id.clone().ok_or("outbox ID missing")?;
     let i = host.tx_inspect(&s.wallet, &s.origin.bloom_chain, &id)?;
+    let refused = location == "failed" && i.tx_hash.is_none() && s.origin_tx_hash.is_none();
+    Ok((i, refused))
+}
+
+fn inspect_outbox<H: Host>(host: &mut H, s: &mut Session) -> Result<(), String> {
+    let (i, refused) = inspect_owned(host, s)?;
     s.outbox_state = Some(i.state.clone());
     if let Some(hash) = i.tx_hash {
         s.origin_tx_hash = Some(hash);
@@ -680,7 +689,7 @@ fn inspect_outbox<H: Host>(host: &mut H, s: &mut Session) -> Result<(), String> 
         s.outbox_receipt = render::sanitize_outbox_receipt(receipt);
     }
     let now = host.now_ms();
-    if matches!(i.state.as_str(), "reverted" | "failed" | "cancelled") {
+    if refused || matches!(i.state.as_str(), "reverted" | "failed" | "cancelled") {
         s.transition(now, "deposit_failed", "Bloom outbox reported failure")
     } else if s.origin_tx_hash.is_some() {
         s.transition(now, "deposit_sent", "origin transaction hash observed")
@@ -834,13 +843,17 @@ pub fn abandon<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<(), Stri
     let result = (|| {
         let mut s = load(host, wallet, id)?;
         crate::accounts::revalidate(host, &s)?;
-        if s.outbox_id.is_some()
+        if (s.outbox_id.is_some()
             || matches!(
                 s.state.as_str(),
                 "deposit_broadcast_pending" | "deposit_sent"
-            )
+            ))
+            && !inspect_owned(host, &s)?.1
         {
-            return Err("cannot abandon after an outbox transaction exists".into());
+            return Err(
+                "cannot abandon while the Bloom outbox transaction is pending or was broadcast"
+                    .into(),
+            );
         }
         s.transition(host.now_ms(), "abandoned", "user abandoned before deposit");
         save(host, &s)
@@ -853,7 +866,7 @@ pub fn abandon<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<(), Stri
 mod workflow_tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use petal::sdk::{HttpRequest, HttpResponse, OutboxInspection, StagedTransaction};
+    use petal::sdk::{HttpRequest, HttpResponse, StagedTransaction};
     use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
     const WALLET: &str = "0x1111111111111111111111111111111111111111";
@@ -1623,6 +1636,51 @@ mod workflow_tests {
                 .origin_tx_hash
                 .as_deref(),
             Some("0xabc")
+        );
+    }
+
+    #[test]
+    fn outbox_refused_before_broadcast_fails_and_can_be_abandoned() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        for _ in 0..2 {
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        }
+        // Bloom policy refuses the confirmation: the entry moves to failed/
+        // with no transaction hash, and the session keeps its marker.
+        shared.borrow_mut().confirm_fails = true;
+        assert!(confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).is_err());
+        shared.borrow_mut().inspect_pending = true;
+        assert!(
+            abandon(&mut host, "alice", &id)
+                .unwrap_err()
+                .contains("cannot abandon")
+        );
+        shared.borrow_mut().outbox_location = Some("failed".into());
+        confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "deposit_failed"
+        );
+        abandon(&mut host, "alice", &id).unwrap();
+        assert_eq!(load(&mut host, "alice", &id).unwrap().state, "abandoned");
+        assert_eq!(shared.borrow().confirm_calls, 1);
+    }
+
+    #[test]
+    fn broadcast_outbox_entry_cannot_be_abandoned_even_after_failure() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        for _ in 0..3 {
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        }
+        shared.borrow_mut().outbox_location = Some("failed".into());
+        assert!(abandon(&mut host, "alice", &id).is_err());
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "deposit_broadcast_pending"
         );
     }
 

@@ -14,7 +14,8 @@ struct Intent {
     data_hex: String,
 }
 
-pub fn verify_owned<H: Host>(host: &mut H, session: &Session) -> Result<(), String> {
+/// Returns the outbox directory (`pending`, `sent` or `failed`) holding the entry.
+pub fn verify_owned<H: Host>(host: &mut H, session: &Session) -> Result<&'static str, String> {
     let account = session.account.as_ref().ok_or("account binding missing")?;
     let id = session.outbox_id.as_deref().ok_or("outbox ID missing")?;
     if id.is_empty()
@@ -53,7 +54,7 @@ pub fn verify_owned<H: Host>(host: &mut H, session: &Session) -> Result<(), Stri
                 "Bloom outbox intent does not match the bound account and prepared deposit".into(),
             );
         }
-        return Ok(());
+        return Ok(state);
     }
     Err("owned outbox entry unavailable in the numbered account; reconcile before retrying".into())
 }
