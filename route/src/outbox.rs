@@ -58,3 +58,42 @@ pub fn verify_owned<H: Host>(host: &mut H, session: &Session) -> Result<&'static
     }
     Err("owned outbox entry unavailable in the numbered account; reconcile before retrying".into())
 }
+
+#[derive(Deserialize)]
+struct FailedIntent {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    policy_checks: Vec<PolicyCheck>,
+}
+
+#[derive(Deserialize)]
+struct PolicyCheck {
+    outcome: String,
+}
+
+/// True only when the owned entry in `failed/` carries evidence that nothing
+/// was signed: Bloom recorded no broadcast attempt, and the entry either holds
+/// a hard policy denial or was cancelled locally by Bloom. An entry the expiry
+/// sweep moved after an ambiguous broadcast has neither, so it never counts.
+pub fn refused_before_signing<H: Host>(host: &mut H, session: &Session) -> Result<bool, String> {
+    let account = session.account.as_ref().ok_or("account binding missing")?;
+    let id = session.outbox_id.as_deref().ok_or("outbox ID missing")?;
+    let dir = format!(
+        "wallets/{}/{}/chains/{}/outbox/failed/{id}",
+        session.wallet, account.number, session.origin.bloom_chain
+    );
+    if host
+        .vfs_read(&format!("{dir}/broadcast_attempted.json"), 64 * 1024)
+        .is_ok()
+    {
+        return Ok(false);
+    }
+    let raw = host.vfs_read(&format!("{dir}/intent.json"), 256 * 1024)?;
+    let intent: FailedIntent =
+        serde_json::from_slice(&raw).map_err(|_| "invalid Bloom outbox intent")?;
+    let denied = intent.policy_checks.iter().any(|c| c.outcome == "deny");
+    let cancelled =
+        intent.status == "cancelled" && host.vfs_read(&format!("{dir}/cancel.txt"), 4096).is_ok();
+    Ok(denied || cancelled)
+}
