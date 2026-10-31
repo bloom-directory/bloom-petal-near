@@ -6,7 +6,8 @@ petal::route_file!(
 1. quoted -> prepared: builds the deposit transaction.
 2. prepared -> staged: stages it in the wallet outbox for the owner to review. Stop here unless the user asked to submit.
 3. staged -> approval_required or deposit_broadcast_pending: asks the owner to approve, or broadcasts if no approval is needed.
-4. approval_required -> deposit_broadcast_pending: after the owner approves, write confirm again to broadcast. Do this before the quote deadline.
+4. approval_required -> deposit_broadcast_pending: after the owner approves, write confirm again. Repeat while the state is approval_required: a wallet policy approval can come before the transaction approval.
+Every confirm is refused once the quote deadline (quote.deadline in quote.json) is less than two minutes away.
 "
             .to_vec(),
         )
