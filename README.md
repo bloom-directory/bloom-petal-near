@@ -19,7 +19,8 @@ Petal maps) on a chain configured in Bloom, because Bloom stages the deposit
 there; a `quote_only` origin fails with `origin blockchain is not executable in
 Bloom`. The destination can be any chain 1Click supports. Optional fields:
 `slippage_bps` (default 100, at most 1000), `deadline_seconds` (300 to 3600,
-default 900) and `refund_to`. If the session's `status.json` shows
+default 900), `quote_waiting_time_ms` (default 3000, at most 10000) and
+`refund_to` (defaults to, and must equal, the wallet address). If the session's `status.json` shows
 `quote_failed`, read `last_error` and retry with a new `session_id`.
 
 Each write of `confirm` to `swaps/<wallet>/<index>/<session_id>/confirm`
@@ -36,8 +37,12 @@ advances one step:
    `approval_required`: on Bloom 0.4.1 a wallet policy approval can come before
    the transaction approval.
 
-Every confirm is refused once the quote deadline (`quote.deadline` in the
-session's `quote.json`) is less than two minutes away.
+Write `confirm`, `y` or `{"confirm":true}`. To accept warnings shown in the
+staged plan, write `{"confirm":true,"acknowledge_warnings":true}`. Steps 1-4
+are refused once the quote deadline (`quote.deadline` in the session's
+`quote.json`) is less than two minutes away. In `deposit_broadcast_pending` or
+`deposit_sent`, `confirm` only inspects the existing outbox entry, even after
+the deadline.
 
 ## Build and test
 
