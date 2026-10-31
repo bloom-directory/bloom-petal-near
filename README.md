@@ -5,6 +5,30 @@ ERC-20 deposits from supported EVM origins, stages them through Bloom's generic
 transaction outbox, and tracks settlement without exposing wallet keys or the
 persisted partner JWT.
 
+## Swapping
+
+Write a JSON request to `/petals/near-intents/swaps/<wallet>/<index>/new`;
+reading that file shows an example. `amount` is in base units of
+`origin_asset` for `EXACT_INPUT` (the amount sent) and of `destination_asset`
+for `EXACT_OUTPUT` (the amount received). USDC has 6 decimals, so 1 USDC is
+`"1000000"`; to receive exactly 0.01 ETH (18 decimals), use `EXACT_OUTPUT`
+with `"10000000000000000"`. Asset IDs and decimals are in
+`/petals/near-intents/tokens.json`. Only the origin chain must be configured in
+Bloom, because Bloom stages the deposit there; the destination can be any chain
+1Click supports. If the session's `status.json` shows `quote_failed`, read
+`last_error` and retry with a new `session_id`.
+
+Each write of `confirm` to `swaps/<wallet>/<index>/<session_id>/confirm`
+advances one step:
+
+1. `quoted` -> `prepared`: builds the deposit transaction.
+2. `prepared` -> `staged`: stages it in the wallet outbox for the owner to
+   review. This is where an agent stops unless the user asked to submit.
+3. `staged` -> `approval_required` or `deposit_broadcast_pending`: asks the
+   owner to approve, or broadcasts if no approval is needed.
+4. `approval_required` -> `deposit_broadcast_pending`: after the owner
+   approves, write `confirm` again to broadcast, before the quote deadline.
+
 ## Build and test
 
 The route crate and `petal-build.toml` pin the canonical SDK and builder from
