@@ -8,7 +8,10 @@ persisted partner JWT.
 ## Swapping
 
 Write a JSON request to `/petals/near-intents/swaps/<wallet>/<index>/new`;
-reading that file shows an example. `amount` is in base units of
+reading that file shows an example. `session_id` is 8 to 64 ASCII letters,
+digits, `-` or `_`, and is one-use: every attempt needs a fresh `session_id`.
+`amount` is a positive integer string with no leading zeros, sign, decimal
+point or exponent. `amount` is in base units of
 `origin_asset` for `EXACT_INPUT` (the amount sent) and of `destination_asset`
 for `EXACT_OUTPUT` (the amount received). USDC has 6 decimals, so 1 USDC is
 `"1000000"`; to receive exactly 0.01 ETH (18 decimals), use `EXACT_OUTPUT`
