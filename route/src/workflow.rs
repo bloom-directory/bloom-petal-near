@@ -8,7 +8,7 @@ use crate::{
     session::{self, Session},
     settings::{self, PartnerJwt},
 };
-use petal::sdk::EvmTransaction;
+use petal::sdk::{EvmTransaction, OutboxInspection};
 use sha2::{Digest, Sha256};
 
 const MAX_UPSTREAM_APP_FEE_BPS: u32 = 40;
@@ -95,10 +95,12 @@ fn iso_deadline(now_ms: u64, seconds: u32) -> Result<String, String> {
     t.format(&time::format_description::well_known::Rfc3339)
         .map_err(|e| e.to_string())
 }
+fn parse_time(value: &str) -> Result<time::OffsetDateTime, String> {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| "quote deadline is not RFC3339".into())
+}
 fn parse_time_ms(value: &str) -> Result<u64, String> {
-    let t = time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
-        .map_err(|_| "quote deadline is not RFC3339")?;
-    u64::try_from(t.unix_timestamp_nanos() / 1_000_000)
+    u64::try_from(parse_time(value)?.unix_timestamp_nanos() / 1_000_000)
         .map_err(|_| "quote deadline predates epoch".into())
 }
 
@@ -169,7 +171,8 @@ fn validate_echo(
         || r.amount != sent.amount
         || r.refund_to != wallet
         || r.recipient != sent.recipient
-        || r.deadline != sent.deadline
+        // 1Click echoes `.140Z` for a sent `.14Z`; compare instants, not text.
+        || parse_time(&r.deadline)? != parse_time(&sent.deadline)?
         || r.quote_waiting_time_ms != sent.quote_waiting_time_ms
     {
         return Err("quote echoed different execution fields".into());
@@ -668,11 +671,29 @@ fn confirm_with_verifier<H: Host, V: Fn(&QuoteResponse) -> Result<String, String
     finish_locked(result, release)
 }
 
-fn inspect_outbox<H: Host>(host: &mut H, s: &mut Session) -> Result<(), String> {
-    crate::outbox::verify_owned(host, s)?;
+/// Inspects the owned outbox entry. The flag is true only when Bloom refused
+/// the entry before signing it (see `outbox::refused_before_signing`). A
+/// `failed/` entry without a hash is not enough: the expiry sweep also moves
+/// entries whose broadcast reply was lost, and those may still land.
+fn inspect_owned<H: Host>(host: &mut H, s: &Session) -> Result<(OutboxInspection, bool), String> {
+    let location = crate::outbox::verify_owned(host, s)?;
     let id = s.outbox_id.clone().ok_or("outbox ID missing")?;
     let i = host.tx_inspect(&s.wallet, &s.origin.bloom_chain, &id)?;
-    s.outbox_state = Some(i.state.clone());
+    let refused = location == "failed"
+        && i.tx_hash.is_none()
+        && s.origin_tx_hash.is_none()
+        && crate::outbox::refused_before_signing(host, s)?;
+    Ok((i, refused))
+}
+
+fn inspect_outbox<H: Host>(host: &mut H, s: &mut Session) -> Result<(), String> {
+    let (i, refused) = inspect_owned(host, s)?;
+    // A policy-refused entry still reports Bloom's `pending` status.
+    s.outbox_state = Some(if refused {
+        "failed".into()
+    } else {
+        i.state.clone()
+    });
     if let Some(hash) = i.tx_hash {
         s.origin_tx_hash = Some(hash);
     }
@@ -680,7 +701,17 @@ fn inspect_outbox<H: Host>(host: &mut H, s: &mut Session) -> Result<(), String> 
         s.outbox_receipt = render::sanitize_outbox_receipt(receipt);
     }
     let now = host.now_ms();
-    if matches!(i.state.as_str(), "reverted" | "failed" | "cancelled") {
+    if refused {
+        s.transition(
+            now,
+            "deposit_failed",
+            "Bloom refused the outbox transaction before broadcast",
+        )
+    } else if matches!(i.state.as_str(), "reverted" | "failed" | "cancelled")
+        // Bloom reports every entry in failed/ as failed, including one swept
+        // after a lost broadcast reply; only a mined receipt makes it final.
+        && i.receipt_json.is_some()
+    {
         s.transition(now, "deposit_failed", "Bloom outbox reported failure")
     } else if s.origin_tx_hash.is_some() {
         s.transition(now, "deposit_sent", "origin transaction hash observed")
@@ -834,13 +865,17 @@ pub fn abandon<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<(), Stri
     let result = (|| {
         let mut s = load(host, wallet, id)?;
         crate::accounts::revalidate(host, &s)?;
-        if s.outbox_id.is_some()
+        if (s.outbox_id.is_some()
             || matches!(
                 s.state.as_str(),
                 "deposit_broadcast_pending" | "deposit_sent"
-            )
+            ))
+            && !inspect_owned(host, &s)?.1
         {
-            return Err("cannot abandon after an outbox transaction exists".into());
+            return Err(
+                "cannot abandon while the Bloom outbox transaction is pending or was broadcast"
+                    .into(),
+            );
         }
         s.transition(host.now_ms(), "abandoned", "user abandoned before deposit");
         save(host, &s)
@@ -853,7 +888,7 @@ pub fn abandon<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<(), Stri
 mod workflow_tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use petal::sdk::{HttpRequest, HttpResponse, OutboxInspection, StagedTransaction};
+    use petal::sdk::{HttpRequest, HttpResponse, StagedTransaction};
     use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
     const WALLET: &str = "0x1111111111111111111111111111111111111111";
@@ -891,6 +926,11 @@ mod workflow_tests {
         wrong_outbox_sender: bool,
         staged_tx: Option<EvmTransaction>,
         outbox_location: Option<String>,
+        /// What a `failed/` entry records: "deny", "cancel", or nothing (expiry sweep).
+        failed_marker: Option<&'static str>,
+        broadcast_attempted: bool,
+        /// Makes reading `broadcast_attempted.json` fail with a non-NotFound error.
+        marker_unreadable: bool,
     }
 
     #[derive(Clone)]
@@ -1063,6 +1103,11 @@ mod workflow_tests {
                 .clone()
                 .unwrap_or_else(|| "alice".into());
             let account = self.0.borrow().selected_account;
+            if path.ends_with("/failed/outbox-1/broadcast_attempted.json")
+                && self.0.borrow().marker_unreadable
+            {
+                return Err("backend error".into());
+            }
             if path == format!("wallets/{wallet}/{account}/account.json") {
                 let shared = self.0.borrow();
                 if shared.missing_account_projection {
@@ -1101,7 +1146,24 @@ mod workflow_tests {
             {
                 let shared = self.0.borrow();
                 let tx = shared.staged_tx.as_ref().ok_or("no staged transaction")?;
-                Ok(serde_json::to_vec(&serde_json::json!({"id":"outbox-1","wallet":wallet,"chain":"ethereum","chain_id":1,"from":if shared.wrong_outbox_sender { DEPOSIT } else { WALLET },"to":tx.to,"value_wei":tx.value_wei,"data_hex":tx.data_hex})).unwrap())
+                let outcome = if shared.failed_marker == Some("deny") {
+                    "deny"
+                } else {
+                    "pass"
+                };
+                let status = if shared.failed_marker == Some("cancel") {
+                    "cancelled"
+                } else {
+                    "pending"
+                };
+                Ok(serde_json::to_vec(&serde_json::json!({"id":"outbox-1","wallet":wallet,"chain":"ethereum","chain_id":1,"from":if shared.wrong_outbox_sender { DEPOSIT } else { WALLET },"to":tx.to,"value_wei":tx.value_wei,"data_hex":tx.data_hex,"status":status,"policy_checks":[{"rule":"allowlists.recipients","outcome":outcome,"message":""}]})).unwrap())
+            } else if path
+                == format!(
+                    "wallets/{wallet}/{account}/chains/ethereum/outbox/failed/outbox-1/broadcast_attempted.json"
+                )
+                && self.0.borrow().broadcast_attempted
+            {
+                Ok(br#"{"tx_hash":"0xabc"}"#.to_vec())
             } else if path == format!("wallets/{wallet}/{account}/address.evm") {
                 if self.0.borrow().missing_zero_address {
                     return Err("account zero address missing".into());
@@ -1181,10 +1243,17 @@ mod workflow_tests {
             if self.0.borrow().inspect_denied {
                 return Err("denied".into());
             }
-            if self.0.borrow().inspect_pending {
+            let shared = self.0.borrow();
+            if shared.inspect_pending {
+                // Bloom 0.4.2 reports every entry in failed/ as failed or cancelled.
+                let state = match (shared.outbox_location.as_deref(), shared.failed_marker) {
+                    (Some("failed"), Some("cancel")) => "cancelled",
+                    (Some("failed"), _) => "failed",
+                    _ => "pending",
+                };
                 return Ok(OutboxInspection {
                     outbox_id: id.into(),
-                    state: "pending".into(),
+                    state: state.into(),
                     tx_hash: None,
                     receipt_json: None,
                 });
@@ -1568,6 +1637,23 @@ mod workflow_tests {
     }
 
     #[test]
+    fn deadline_echo_compares_instants_not_text() {
+        let mut host = MockHost(Rc::new(RefCell::new(Shared::default())));
+        let id = bound_session(&mut host);
+        let s = load(&mut host, "alice", &id).unwrap();
+        let mut sent = s.quote.quote_request.clone();
+        sent.deadline = iso_deadline(1_792_978_513_140, 900).unwrap();
+        assert_eq!(sent.deadline, "2026-10-26T01:50:13.14Z");
+        let mut got = s.quote.clone();
+        got.quote_request.deadline = "2026-10-26T01:50:13.140Z".into();
+        assert!(validate_echo(&sent, &got, &s.wallet_address, host.now_ms()).is_ok());
+        got.quote_request.deadline = "2026-10-26T01:50:13.141Z".into();
+        assert!(validate_echo(&sent, &got, &s.wallet_address, host.now_ms()).is_err());
+        got.quote_request.deadline = "2026-10-26T01:50:13.140000001Z".into();
+        assert!(validate_echo(&sent, &got, &s.wallet_address, host.now_ms()).is_err());
+    }
+
+    #[test]
     fn account_zero_address_change_rejects_prepare_stage_authorization_and_submission() {
         for transitions in 0..=3 {
             let shared = Rc::new(RefCell::new(Shared::default()));
@@ -1623,6 +1709,136 @@ mod workflow_tests {
                 .origin_tx_hash
                 .as_deref(),
             Some("0xabc")
+        );
+    }
+
+    #[test]
+    fn outbox_refused_before_broadcast_fails_and_can_be_abandoned() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        for _ in 0..2 {
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        }
+        // Bloom policy refuses the confirmation: the entry moves to failed/
+        // with no transaction hash, and the session keeps its marker.
+        shared.borrow_mut().confirm_fails = true;
+        assert!(confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).is_err());
+        shared.borrow_mut().inspect_pending = true;
+        assert!(
+            abandon(&mut host, "alice", &id)
+                .unwrap_err()
+                .contains("cannot abandon")
+        );
+        shared.borrow_mut().outbox_location = Some("failed".into());
+        shared.borrow_mut().failed_marker = Some("deny");
+        confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        let failed = load(&mut host, "alice", &id).unwrap();
+        assert_eq!(failed.state, "deposit_failed");
+        assert_eq!(failed.outbox_state.as_deref(), Some("failed"));
+        abandon(&mut host, "alice", &id).unwrap();
+        assert_eq!(load(&mut host, "alice", &id).unwrap().state, "abandoned");
+        assert_eq!(shared.borrow().confirm_calls, 1);
+    }
+
+    /// Moves a confirmed session's entry to `failed/` without a hash, as a
+    /// policy refusal, a local cancel or the expiry sweep would.
+    fn session_with_failed_entry(
+        marker: Option<&'static str>,
+        broadcast_attempted: bool,
+    ) -> (Rc<RefCell<Shared>>, MockHost, String) {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        for _ in 0..2 {
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        }
+        shared.borrow_mut().confirm_fails = true;
+        assert!(confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).is_err());
+        let mut s = shared.borrow_mut();
+        s.inspect_pending = true;
+        s.outbox_location = Some("failed".into());
+        s.failed_marker = marker;
+        s.broadcast_attempted = broadcast_attempted;
+        drop(s);
+        (shared, host, id)
+    }
+
+    #[test]
+    fn failed_entry_with_a_broadcast_attempt_cannot_be_abandoned() {
+        // A lost broadcast reply leaves broadcast_attempted.json; the deposit
+        // may land even though the entry later sits in failed/.
+        let (_shared, mut host, id) = session_with_failed_entry(Some("deny"), true);
+        refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).unwrap();
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "deposit_broadcast_pending"
+        );
+        assert!(
+            abandon(&mut host, "alice", &id)
+                .unwrap_err()
+                .contains("cannot abandon")
+        );
+    }
+
+    #[test]
+    fn expiry_swept_entry_without_refusal_evidence_cannot_be_abandoned() {
+        let (_shared, mut host, id) = session_with_failed_entry(None, false);
+        refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).unwrap();
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "deposit_broadcast_pending"
+        );
+        assert!(abandon(&mut host, "alice", &id).is_err());
+    }
+
+    #[test]
+    fn locally_cancelled_entry_cannot_be_abandoned() {
+        // Bloom 0.4.1 could write cancel.txt after signing was dispatched, and
+        // 0.4.2 writes the same file, so a cancel never proves nothing was signed.
+        let (_shared, mut host, id) = session_with_failed_entry(Some("cancel"), false);
+        refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).unwrap();
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "deposit_broadcast_pending"
+        );
+        assert!(abandon(&mut host, "alice", &id).is_err());
+    }
+
+    #[test]
+    fn unreadable_broadcast_marker_is_not_treated_as_absent() {
+        let (shared, mut host, id) = session_with_failed_entry(Some("deny"), false);
+        shared.borrow_mut().marker_unreadable = true;
+        assert!(refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).is_err());
+        assert!(abandon(&mut host, "alice", &id).is_err());
+        assert_ne!(load(&mut host, "alice", &id).unwrap().state, "abandoned");
+    }
+
+    #[test]
+    fn refresh_fails_a_policy_denied_entry_and_allows_abandon() {
+        let (_shared, mut host, id) = session_with_failed_entry(Some("deny"), false);
+        refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).unwrap();
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "deposit_failed"
+        );
+        abandon(&mut host, "alice", &id).unwrap();
+        assert_eq!(load(&mut host, "alice", &id).unwrap().state, "abandoned");
+    }
+
+    #[test]
+    fn broadcast_outbox_entry_cannot_be_abandoned_even_after_failure() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let mut host = MockHost(shared.clone());
+        let id = bound_session(&mut host);
+        for _ in 0..3 {
+            confirm_with_verifier(&mut host, "alice", &id, b"confirm", test_verify).unwrap();
+        }
+        shared.borrow_mut().outbox_location = Some("failed".into());
+        assert!(abandon(&mut host, "alice", &id).is_err());
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "deposit_broadcast_pending"
         );
     }
 

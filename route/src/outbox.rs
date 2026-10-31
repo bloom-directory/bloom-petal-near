@@ -14,7 +14,8 @@ struct Intent {
     data_hex: String,
 }
 
-pub fn verify_owned<H: Host>(host: &mut H, session: &Session) -> Result<(), String> {
+/// Returns the outbox directory (`pending`, `sent` or `failed`) holding the entry.
+pub fn verify_owned<H: Host>(host: &mut H, session: &Session) -> Result<&'static str, String> {
     let account = session.account.as_ref().ok_or("account binding missing")?;
     let id = session.outbox_id.as_deref().ok_or("outbox ID missing")?;
     if id.is_empty()
@@ -53,7 +54,42 @@ pub fn verify_owned<H: Host>(host: &mut H, session: &Session) -> Result<(), Stri
                 "Bloom outbox intent does not match the bound account and prepared deposit".into(),
             );
         }
-        return Ok(());
+        return Ok(state);
     }
     Err("owned outbox entry unavailable in the numbered account; reconcile before retrying".into())
+}
+
+#[derive(Deserialize)]
+struct FailedIntent {
+    #[serde(default)]
+    policy_checks: Vec<PolicyCheck>,
+}
+
+#[derive(Deserialize)]
+struct PolicyCheck {
+    outcome: String,
+}
+
+/// True only when the owned entry in `failed/` carries evidence that nothing
+/// was signed: Bloom recorded no broadcast attempt, and the entry holds a hard
+/// policy denial. Policy checks are fixed at staging and every Bloom signing
+/// path refuses a denied entry. A local cancel is not evidence: Bloom 0.4.1
+/// could cancel after signing was dispatched and 0.4.2 writes the same files.
+pub fn refused_before_signing<H: Host>(host: &mut H, session: &Session) -> Result<bool, String> {
+    let account = session.account.as_ref().ok_or("account binding missing")?;
+    let id = session.outbox_id.as_deref().ok_or("outbox ID missing")?;
+    let dir = format!(
+        "wallets/{}/{}/chains/{}/outbox/failed/{id}",
+        session.wallet, account.number, session.origin.bloom_chain
+    );
+    // Only a missing marker proves no broadcast; any other read error is unknown.
+    match host.vfs_read(&format!("{dir}/broadcast_attempted.json"), 64 * 1024) {
+        Err(error) if error == "not found" => {}
+        Ok(_) => return Ok(false),
+        Err(error) => return Err(format!("cannot read Bloom broadcast marker: {error}")),
+    }
+    let raw = host.vfs_read(&format!("{dir}/intent.json"), 256 * 1024)?;
+    let intent: FailedIntent =
+        serde_json::from_slice(&raw).map_err(|_| "invalid Bloom outbox intent")?;
+    Ok(intent.policy_checks.iter().any(|c| c.outcome == "deny"))
 }

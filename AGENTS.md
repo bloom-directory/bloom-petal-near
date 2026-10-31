@@ -1,5 +1,8 @@
 # NEAR Intents Petal
 
+To make a swap, follow `README.md`, "Swapping": amounts are in base units, and
+two `confirm` writes stage the deposit for the owner's approval.
+
 Implement and review this package against `docs/2026-07-14-near-intents-petal-design.md`.
 Never run a live-money swap without explicit user authorization.
 
