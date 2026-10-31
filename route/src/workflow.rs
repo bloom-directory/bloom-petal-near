@@ -95,10 +95,12 @@ fn iso_deadline(now_ms: u64, seconds: u32) -> Result<String, String> {
     t.format(&time::format_description::well_known::Rfc3339)
         .map_err(|e| e.to_string())
 }
+fn parse_time(value: &str) -> Result<time::OffsetDateTime, String> {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| "quote deadline is not RFC3339".into())
+}
 fn parse_time_ms(value: &str) -> Result<u64, String> {
-    let t = time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
-        .map_err(|_| "quote deadline is not RFC3339")?;
-    u64::try_from(t.unix_timestamp_nanos() / 1_000_000)
+    u64::try_from(parse_time(value)?.unix_timestamp_nanos() / 1_000_000)
         .map_err(|_| "quote deadline predates epoch".into())
 }
 
@@ -170,7 +172,7 @@ fn validate_echo(
         || r.refund_to != wallet
         || r.recipient != sent.recipient
         // 1Click echoes `.140Z` for a sent `.14Z`; compare instants, not text.
-        || parse_time_ms(&r.deadline)? != parse_time_ms(&sent.deadline)?
+        || parse_time(&r.deadline)? != parse_time(&sent.deadline)?
         || r.quote_waiting_time_ms != sent.quote_waiting_time_ms
     {
         return Err("quote echoed different execution fields".into());
@@ -1580,6 +1582,8 @@ mod workflow_tests {
         got.quote_request.deadline = "2026-10-26T01:50:13.140Z".into();
         assert!(validate_echo(&sent, &got, &s.wallet_address, host.now_ms()).is_ok());
         got.quote_request.deadline = "2026-10-26T01:50:13.141Z".into();
+        assert!(validate_echo(&sent, &got, &s.wallet_address, host.now_ms()).is_err());
+        got.quote_request.deadline = "2026-10-26T01:50:13.140000001Z".into();
         assert!(validate_echo(&sent, &got, &s.wallet_address, host.now_ms()).is_err());
     }
 
