@@ -62,8 +62,6 @@ pub fn verify_owned<H: Host>(host: &mut H, session: &Session) -> Result<&'static
 #[derive(Deserialize)]
 struct FailedIntent {
     #[serde(default)]
-    status: String,
-    #[serde(default)]
     policy_checks: Vec<PolicyCheck>,
 }
 
@@ -73,9 +71,10 @@ struct PolicyCheck {
 }
 
 /// True only when the owned entry in `failed/` carries evidence that nothing
-/// was signed: Bloom recorded no broadcast attempt, and the entry either holds
-/// a hard policy denial or was cancelled locally by Bloom. An entry the expiry
-/// sweep moved after an ambiguous broadcast has neither, so it never counts.
+/// was signed: Bloom recorded no broadcast attempt, and the entry holds a hard
+/// policy denial. Policy checks are fixed at staging and every Bloom signing
+/// path refuses a denied entry. A local cancel is not evidence: Bloom 0.4.1
+/// could cancel after signing was dispatched and 0.4.2 writes the same files.
 pub fn refused_before_signing<H: Host>(host: &mut H, session: &Session) -> Result<bool, String> {
     let account = session.account.as_ref().ok_or("account binding missing")?;
     let id = session.outbox_id.as_deref().ok_or("outbox ID missing")?;
@@ -92,23 +91,5 @@ pub fn refused_before_signing<H: Host>(host: &mut H, session: &Session) -> Resul
     let raw = host.vfs_read(&format!("{dir}/intent.json"), 256 * 1024)?;
     let intent: FailedIntent =
         serde_json::from_slice(&raw).map_err(|_| "invalid Bloom outbox intent")?;
-    let denied = intent.policy_checks.iter().any(|c| c.outcome == "deny");
-    let cancelled = intent.status == "cancelled"
-        && host.vfs_read(&format!("{dir}/cancel.txt"), 4096).is_ok()
-        && cancel_excludes_signing(host);
-    Ok(denied || cancelled)
-}
-
-/// Before Bloom 0.4.2 a local cancel could race a confirm that had already
-/// sent the transaction to be signed, and still write `cancel.txt`. From
-/// 0.4.2 (bloom#411) cancel and signing share one lock, so a cancelled entry
-/// was never signed. An unreadable or older version is not proof.
-fn cancel_excludes_signing<H: Host>(host: &mut H) -> bool {
-    let Ok(raw) = host.vfs_read("status/version", 256) else {
-        return false;
-    };
-    let text = String::from_utf8_lossy(&raw);
-    let core = text.trim().split(['-', '+']).next().unwrap_or("");
-    let parts: Vec<u64> = core.split('.').map_while(|p| p.parse().ok()).collect();
-    parts.len() == 3 && (parts[0], parts[1], parts[2]) >= (0, 4, 2)
+    Ok(intent.policy_checks.iter().any(|c| c.outcome == "deny"))
 }

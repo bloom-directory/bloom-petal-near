@@ -816,15 +816,17 @@ No transition from `abandoned` is allowed. `abandon` is rejected while an
 outbox transaction is pending or after it was broadcast, because it cannot
 cancel the external transfer. It is allowed only when the owned entry is in
 `failed/` with evidence that nothing was signed: no transaction hash, no
-`broadcast_attempted.json`, and either a hard policy `deny` check in
-`intent.json` or Bloom's own local cancel (`status: cancelled` with
-`cancel.txt`). The local cancel counts only when `status/version` reads 0.4.2
-or later: older Bloom could cancel after signing was dispatched. A read
-error on `broadcast_attempted.json` other than not-found is an error, not
-absence. A `failed/` entry without that evidence, such as one the expiry
+`broadcast_attempted.json`, and a hard policy `deny` check in `intent.json`.
+Bloom fixes policy checks at staging and refuses to sign a denied entry on
+every version. A local cancel (`cancel.txt`) is not evidence: Bloom 0.4.1
+could cancel after signing was dispatched, and 0.4.2 writes the same files.
+A read error on `broadcast_attempted.json` other than not-found is an error,
+not absence. A `failed/` entry without that evidence, such as one the expiry
 sweep moved after a lost broadcast reply, still blocks abandon. `confirm` and
 `refresh` move a refused session to `deposit_failed` and record its outbox
-state as `failed`.
+state as `failed`. Bloom reports every entry in `failed/` as `failed` or
+`cancelled`, so without refusal evidence or a mined receipt the session stays
+in `deposit_broadcast_pending`.
 
 ## 18. Idempotency and recovery invariants
 

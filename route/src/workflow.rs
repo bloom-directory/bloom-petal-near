@@ -707,7 +707,11 @@ fn inspect_outbox<H: Host>(host: &mut H, s: &mut Session) -> Result<(), String> 
             "deposit_failed",
             "Bloom refused the outbox transaction before broadcast",
         )
-    } else if matches!(i.state.as_str(), "reverted" | "failed" | "cancelled") {
+    } else if matches!(i.state.as_str(), "reverted" | "failed" | "cancelled")
+        // Bloom reports every entry in failed/ as failed, including one swept
+        // after a lost broadcast reply; only a mined receipt makes it final.
+        && i.receipt_json.is_some()
+    {
         s.transition(now, "deposit_failed", "Bloom outbox reported failure")
     } else if s.origin_tx_hash.is_some() {
         s.transition(now, "deposit_sent", "origin transaction hash observed")
@@ -927,8 +931,6 @@ mod workflow_tests {
         broadcast_attempted: bool,
         /// Makes reading `broadcast_attempted.json` fail with a non-NotFound error.
         marker_unreadable: bool,
-        /// What `status/version` returns; `None` means unreadable.
-        bloom_version: Option<&'static str>,
     }
 
     #[derive(Clone)]
@@ -1101,14 +1103,6 @@ mod workflow_tests {
                 .clone()
                 .unwrap_or_else(|| "alice".into());
             let account = self.0.borrow().selected_account;
-            if path == "status/version" {
-                return self
-                    .0
-                    .borrow()
-                    .bloom_version
-                    .map(|v| format!("{v}\n").into_bytes())
-                    .ok_or_else(|| "backend error".into());
-            }
             if path.ends_with("/failed/outbox-1/broadcast_attempted.json")
                 && self.0.borrow().marker_unreadable
             {
@@ -1256,10 +1250,17 @@ mod workflow_tests {
             if self.0.borrow().inspect_denied {
                 return Err("denied".into());
             }
-            if self.0.borrow().inspect_pending {
+            let shared = self.0.borrow();
+            if shared.inspect_pending {
+                // Bloom 0.4.2 reports every entry in failed/ as failed or cancelled.
+                let state = match (shared.outbox_location.as_deref(), shared.failed_marker) {
+                    (Some("failed"), Some("cancel")) => "cancelled",
+                    (Some("failed"), _) => "failed",
+                    _ => "pending",
+                };
                 return Ok(OutboxInspection {
                     outbox_id: id.into(),
-                    state: "pending".into(),
+                    state: state.into(),
                     tx_hash: None,
                     receipt_json: None,
                 });
@@ -1799,18 +1800,16 @@ mod workflow_tests {
     }
 
     #[test]
-    fn cancelled_entry_on_a_bloom_without_the_signing_lock_cannot_be_abandoned() {
-        // Bloom before 0.4.2 could write cancel.txt after signing was dispatched.
-        for version in [Some("0.4.1"), None] {
-            let (shared, mut host, id) = session_with_failed_entry(Some("cancel"), false);
-            shared.borrow_mut().bloom_version = version;
-            refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).unwrap();
-            assert_eq!(
-                load(&mut host, "alice", &id).unwrap().state,
-                "deposit_broadcast_pending"
-            );
-            assert!(abandon(&mut host, "alice", &id).is_err());
-        }
+    fn locally_cancelled_entry_cannot_be_abandoned() {
+        // Bloom 0.4.1 could write cancel.txt after signing was dispatched, and
+        // 0.4.2 writes the same file, so a cancel never proves nothing was signed.
+        let (_shared, mut host, id) = session_with_failed_entry(Some("cancel"), false);
+        refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).unwrap();
+        assert_eq!(
+            load(&mut host, "alice", &id).unwrap().state,
+            "deposit_broadcast_pending"
+        );
+        assert!(abandon(&mut host, "alice", &id).is_err());
     }
 
     #[test]
@@ -1823,9 +1822,8 @@ mod workflow_tests {
     }
 
     #[test]
-    fn refresh_fails_a_locally_cancelled_entry_and_allows_abandon() {
-        let (shared, mut host, id) = session_with_failed_entry(Some("cancel"), false);
-        shared.borrow_mut().bloom_version = Some("0.4.2");
+    fn refresh_fails_a_policy_denied_entry_and_allows_abandon() {
+        let (_shared, mut host, id) = session_with_failed_entry(Some("deny"), false);
         refresh_with_verifier(&mut host, "alice", &id, b"refresh", test_verify).unwrap();
         assert_eq!(
             load(&mut host, "alice", &id).unwrap().state,
