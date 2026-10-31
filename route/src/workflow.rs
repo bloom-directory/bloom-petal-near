@@ -1164,13 +1164,6 @@ mod workflow_tests {
                 && self.0.borrow().broadcast_attempted
             {
                 Ok(br#"{"tx_hash":"0xabc"}"#.to_vec())
-            } else if path
-                == format!(
-                    "wallets/{wallet}/{account}/chains/ethereum/outbox/failed/outbox-1/cancel.txt"
-                )
-                && self.0.borrow().failed_marker == Some("cancel")
-            {
-                Ok(b"cancelled by user".to_vec())
             } else if path == format!("wallets/{wallet}/{account}/address.evm") {
                 if self.0.borrow().missing_zero_address {
                     return Err("account zero address missing".into());
