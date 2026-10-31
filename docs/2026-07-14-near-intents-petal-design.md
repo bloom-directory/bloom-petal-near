@@ -818,7 +818,10 @@ cancel the external transfer. It is allowed only when the owned entry is in
 `failed/` with evidence that nothing was signed: no transaction hash, no
 `broadcast_attempted.json`, and either a hard policy `deny` check in
 `intent.json` or Bloom's own local cancel (`status: cancelled` with
-`cancel.txt`). A `failed/` entry without that evidence, such as one the expiry
+`cancel.txt`). The local cancel counts only when `status/version` reads 0.4.2
+or later: older Bloom could cancel after signing was dispatched. A read
+error on `broadcast_attempted.json` other than not-found is an error, not
+absence. A `failed/` entry without that evidence, such as one the expiry
 sweep moved after a lost broadcast reply, still blocks abandon. `confirm` and
 `refresh` move a refused session to `deposit_failed` and record its outbox
 state as `failed`.

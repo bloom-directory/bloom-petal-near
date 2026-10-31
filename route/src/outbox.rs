@@ -83,17 +83,32 @@ pub fn refused_before_signing<H: Host>(host: &mut H, session: &Session) -> Resul
         "wallets/{}/{}/chains/{}/outbox/failed/{id}",
         session.wallet, account.number, session.origin.bloom_chain
     );
-    if host
-        .vfs_read(&format!("{dir}/broadcast_attempted.json"), 64 * 1024)
-        .is_ok()
-    {
-        return Ok(false);
+    // Only a missing marker proves no broadcast; any other read error is unknown.
+    match host.vfs_read(&format!("{dir}/broadcast_attempted.json"), 64 * 1024) {
+        Err(error) if error == "not found" => {}
+        Ok(_) => return Ok(false),
+        Err(error) => return Err(format!("cannot read Bloom broadcast marker: {error}")),
     }
     let raw = host.vfs_read(&format!("{dir}/intent.json"), 256 * 1024)?;
     let intent: FailedIntent =
         serde_json::from_slice(&raw).map_err(|_| "invalid Bloom outbox intent")?;
     let denied = intent.policy_checks.iter().any(|c| c.outcome == "deny");
-    let cancelled =
-        intent.status == "cancelled" && host.vfs_read(&format!("{dir}/cancel.txt"), 4096).is_ok();
+    let cancelled = intent.status == "cancelled"
+        && host.vfs_read(&format!("{dir}/cancel.txt"), 4096).is_ok()
+        && cancel_excludes_signing(host);
     Ok(denied || cancelled)
+}
+
+/// Before Bloom 0.4.2 a local cancel could race a confirm that had already
+/// sent the transaction to be signed, and still write `cancel.txt`. From
+/// 0.4.2 (bloom#411) cancel and signing share one lock, so a cancelled entry
+/// was never signed. An unreadable or older version is not proof.
+fn cancel_excludes_signing<H: Host>(host: &mut H) -> bool {
+    let Ok(raw) = host.vfs_read("status/version", 256) else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&raw);
+    let core = text.trim().split(['-', '+']).next().unwrap_or("");
+    let parts: Vec<u64> = core.split('.').map_while(|p| p.parse().ok()).collect();
+    parts.len() == 3 && (parts[0], parts[1], parts[2]) >= (0, 4, 2)
 }
