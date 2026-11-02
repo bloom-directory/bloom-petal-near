@@ -688,6 +688,11 @@ fn inspect_owned<H: Host>(host: &mut H, s: &Session) -> Result<(OutboxInspection
 
 fn inspect_outbox<H: Host>(host: &mut H, s: &mut Session) -> Result<(), String> {
     let (i, refused) = inspect_owned(host, s)?;
+    record_inspection(host, s, i, refused);
+    save(host, s)
+}
+
+fn record_inspection<H: Host>(host: &mut H, s: &mut Session, i: OutboxInspection, refused: bool) {
     // Bloom 0.4.1 reports a policy-refused entry as `pending`; 0.4.2 reports
     // `failed`. Record `failed` for both.
     s.outbox_state = Some(if refused {
@@ -717,7 +722,6 @@ fn inspect_outbox<H: Host>(host: &mut H, s: &mut Session) -> Result<(), String> 
     } else if s.origin_tx_hash.is_some() {
         s.transition(now, "deposit_sent", "origin transaction hash observed")
     }
-    save(host, s)
 }
 
 pub fn refresh<H: Host>(host: &mut H, wallet: &str, id: &str, body: &[u8]) -> Result<(), String> {
@@ -866,17 +870,23 @@ pub fn abandon<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<(), Stri
     let result = (|| {
         let mut s = load(host, wallet, id)?;
         crate::accounts::revalidate(host, &s)?;
-        if (s.outbox_id.is_some()
+        if s.outbox_id.is_some()
             || matches!(
                 s.state.as_str(),
                 "deposit_broadcast_pending" | "deposit_sent"
-            ))
-            && !inspect_owned(host, &s)?.1
+            )
         {
-            return Err(
-                "cannot abandon while the Bloom outbox transaction is pending or was broadcast"
-                    .into(),
-            );
+            let (i, refused) = inspect_owned(host, &s)?;
+            if !refused {
+                return Err(
+                    "cannot abandon while the Bloom outbox transaction is pending or was broadcast"
+                        .into(),
+                );
+            }
+            // Record the refusal first, as confirm and refresh would.
+            if s.state != "deposit_failed" {
+                record_inspection(host, &mut s, i, true);
+            }
         }
         s.transition(host.now_ms(), "abandoned", "user abandoned before deposit");
         save(host, &s)
@@ -1825,6 +1835,17 @@ mod workflow_tests {
         );
         abandon(&mut host, "alice", &id).unwrap();
         assert_eq!(load(&mut host, "alice", &id).unwrap().state, "abandoned");
+    }
+
+    #[test]
+    fn direct_abandon_records_the_refusal_before_abandoning() {
+        let (_shared, mut host, id) = session_with_failed_entry(Some("deny"), false);
+        abandon(&mut host, "alice", &id).unwrap();
+        let s = load(&mut host, "alice", &id).unwrap();
+        assert_eq!(s.state, "abandoned");
+        assert_eq!(s.outbox_state.as_deref(), Some("failed"));
+        let steps: Vec<_> = s.history.iter().map(|h| h.to.as_str()).collect();
+        assert_eq!(steps[steps.len() - 2..], ["deposit_failed", "abandoned"]);
     }
 
     #[test]
