@@ -688,7 +688,8 @@ fn inspect_owned<H: Host>(host: &mut H, s: &Session) -> Result<(OutboxInspection
 
 fn inspect_outbox<H: Host>(host: &mut H, s: &mut Session) -> Result<(), String> {
     let (i, refused) = inspect_owned(host, s)?;
-    // A policy-refused entry still reports Bloom's `pending` status.
+    // Bloom 0.4.1 reports a policy-refused entry as `pending`; 0.4.2 reports
+    // `failed`. Record `failed` for both.
     s.outbox_state = Some(if refused {
         "failed".into()
     } else {
