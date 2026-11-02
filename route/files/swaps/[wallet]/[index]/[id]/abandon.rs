@@ -1,8 +1,8 @@
 petal::route_file!(
-    spec: petal::write_spec().caps(&["bloom:store", "bloom:vfs.read"]),
+    spec: petal::write_spec().caps(&["bloom:store", "bloom:tx.outbox", "bloom:vfs.read"]),
     read: |_ctx: &petal::Ctx| {
         petal::DispatchResponse::Read(
-            b"write abandon before any outbox transaction exists\n".to_vec(),
+            b"write abandon before any outbox transaction exists, or after Bloom refused it unbroadcast\n".to_vec(),
         )
     },
     write: |ctx: &petal::Ctx, _body: &[u8]| {
