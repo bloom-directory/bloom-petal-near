@@ -1,8 +1,6 @@
 petal::route_file!(
     spec: petal::write_spec().caps(&["bloom:http", "bloom:store", "bloom:chain", "bloom:vfs.read"]),
     read: |_ctx: &petal::Ctx| {
-        // The complete request shape and the steps after it, so an agent
-        // never has to read this package's source to swap.
         petal::DispatchResponse::Read(
             br#"Write one JSON object to request a quote. Example, exactly 1 USDC from Ethereum to Arbitrum:
 {"session_id":"usdc-eth-arb-1","swap_type":"EXACT_INPUT","origin_asset":"nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near","destination_asset":"nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near","amount":"1000000","recipient":"<destination address>"}
