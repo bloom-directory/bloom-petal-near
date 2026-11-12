@@ -12,10 +12,32 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         Ok(value) => value,
         Err(error) => return petal::error(-1, error),
     };
+    let venue_policy = session
+        .policy_checks
+        .as_ref()
+        .and_then(|checks| checks.as_array())
+        .map(|checks| {
+            checks
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "- **{}** ({}): {}\n",
+                        entry.get("rule").and_then(|v| v.as_str()).unwrap_or("?"),
+                        entry.get("outcome").and_then(|v| v.as_str()).unwrap_or("?"),
+                        entry.get("message").and_then(|v| v.as_str()).unwrap_or(""),
+                    )
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_else(|| "- not evaluated\n".into());
+    // Once the deposit is staged this route serves Bloom's outbox plan, and
+    // that is what the owner reads when approving. The guard-rail result has
+    // to travel with it: rendering the venue policy only before staging would
+    // hide it at the one moment it decides anything.
     if let Some(outbox) = &session.plan_md {
         return petal::DispatchResponse::Read(
             format!(
-                "# NEAR Intents 1Click swap\n\nThe following is Bloom's authoritative transaction plan.\n\n{outbox}"
+                "# NEAR Intents 1Click swap\n\nThe following is Bloom's authoritative transaction plan.\n\n{outbox}\n\n## Venue policy\n\nThis wallet's own rules, at `settings/wallets/<wallet>/venue.toml`. They are\nguard rails the Petal enforces; Bloom's wallet policy still decides what may be\nsigned.\n\n{venue_policy}"
             )
             .into_bytes(),
         );
@@ -39,7 +61,7 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         .unwrap_or_else(|| "none".into());
     petal::DispatchResponse::Read(
         format!(
-            "# NEAR Intents 1Click swap\n\nFunds will be transferred temporarily into the signed 1Click swapping flow.\n\n- Wallet: `{}` (`{}`)\n- Account number: `{}`\n- Origin: `{}` (chain ID {})\n- Input: {} {} (`{}` decimals), contract: `{}`\n- Deposit amount: `{}`; informational USD estimate: `{}`\n- Upstream application fee: {}\n- Destination asset: `{}`\n- Recipient: `{}`\n- Quoted/min output: `{}` / `{}`\n- Slippage: {} bps\n- Refund address: `{}`; refund fee: `{}`\n- Withdrawal fee: `{}`; estimated execution: {} seconds\n- Signed deposit address: `{}`\n- Quote verified: {}\n- Correlation ID: `{}`\n- Quote hash: `{}`\n- Deadline / inactive time: `{}` / `{}`\n- EVM to/value/data: `{}` / `{}` / `{}`\n\nWarnings: NEAR Intents has no testnet; mainnet broadcasting remains controlled by Bloom opt-in; settlement may take minutes.\n",
+            "# NEAR Intents 1Click swap\n\nFunds will be transferred temporarily into the signed 1Click swapping flow.\n\n- Wallet: `{}` (`{}`)\n- Account number: `{}`\n- Origin: `{}` (chain ID {})\n- Input: {} {} (`{}` decimals), contract: `{}`\n- Deposit amount: `{}`; informational USD estimate: `{}`\n- Upstream application fee: {}\n- Destination asset: `{}`\n- Recipient: `{}`\n- Quoted/min output: `{}` / `{}`\n- Slippage: {} bps\n- Refund address: `{}`; refund fee: `{}`\n- Withdrawal fee: `{}`; estimated execution: {} seconds\n- Signed deposit address: `{}`\n- Quote verified: {}\n- Quote credential: {}\n- Correlation ID: `{}`\n- Quote hash: `{}`\n- Deadline / inactive time: `{}` / `{}`\n- EVM to/value/data: `{}` / `{}` / `{}`\n\n## Venue policy\n\nThis wallet's own rules, at `settings/wallets/<wallet>/venue.toml`. They are\nguard rails the Petal enforces; Bloom's wallet policy still decides what may be\nsigned.\n\n{}\nWarnings: NEAR Intents has no testnet; mainnet broadcasting remains controlled by Bloom opt-in; settlement may take minutes.\n",
             session.wallet,
             session.wallet_address,
             session.account.as_ref().map(|a| a.number.to_string()).unwrap_or_else(|| "unbound legacy session".into()),
@@ -63,6 +85,11 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
             quote.time_estimate,
             quote.deposit_address.as_deref().unwrap_or("missing"),
             session.quote_verified,
+            match session.quote_authenticated {
+                Some(true) => "partner JWT (partner fee schedule)",
+                Some(false) => "none; 1Click charges its unauthenticated platform fee",
+                None => "not recorded",
+            },
             session.quote.correlation_id,
             session.quote_hash,
             quote.deadline.as_deref().unwrap_or("missing"),
@@ -76,6 +103,7 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
             transaction
                 .map(|value| value.data_hex.as_str())
                 .unwrap_or("not prepared"),
+            venue_policy,
         )
         .into_bytes(),
     )

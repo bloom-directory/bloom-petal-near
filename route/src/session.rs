@@ -46,6 +46,17 @@ pub struct Session {
     pub quote: QuoteResponse,
     pub quote_hash: String,
     pub quote_verified: bool,
+    /// The venue policy checks this swap passed when it was quoted.
+    #[serde(default)]
+    pub policy_checks: Option<serde_json::Value>,
+    /// 1Click blockchain code the output settles on, for the venue policy.
+    #[serde(default)]
+    pub destination_chain: Option<String>,
+    /// Whether the quote was requested with a partner credential. An
+    /// unauthenticated quote carries 1Click's higher platform fee, so the
+    /// owner sees which one they are approving.
+    #[serde(default)]
+    pub quote_authenticated: Option<bool>,
     pub prepared_transaction: Option<PreparedTransaction>,
     pub prepared_digest: Option<String>,
     pub plan_md: Option<String>,

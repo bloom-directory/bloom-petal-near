@@ -61,11 +61,11 @@ pub fn tokens<H: crate::workflow::Host>(
 
 pub fn quote<H: crate::workflow::Host>(
     host: &mut H,
-    jwt: &PartnerJwt,
+    jwt: Option<&PartnerJwt>,
     body: &QuoteRequest,
 ) -> Result<(QuoteResponse, Vec<u8>), String> {
     let encoded = serde_json::to_vec(body).map_err(|e| e.to_string())?;
-    let raw = request(host, "POST", "/v0/quote", Some(jwt), encoded)?;
+    let raw = request(host, "POST", "/v0/quote", jwt, encoded)?;
     let quote = crate::api_types::from_slice_no_duplicates(&raw)
         .map_err(|e| format!("strict quote response: {e}"))?;
     Ok((quote, raw))
@@ -73,7 +73,7 @@ pub fn quote<H: crate::workflow::Host>(
 
 pub fn submit<H: crate::workflow::Host>(
     host: &mut H,
-    jwt: &PartnerJwt,
+    jwt: Option<&PartnerJwt>,
     tx_hash: &str,
     deposit_address: &str,
 ) -> Result<Vec<u8>, String> {
@@ -81,7 +81,7 @@ pub fn submit<H: crate::workflow::Host>(
         host,
         "POST",
         "/v0/deposit/submit",
-        Some(jwt),
+        jwt,
         serde_json::to_vec(&serde_json::json!({"txHash":tx_hash,"depositAddress":deposit_address}))
             .unwrap(),
     )
@@ -89,19 +89,13 @@ pub fn submit<H: crate::workflow::Host>(
 
 pub fn status<H: crate::workflow::Host>(
     host: &mut H,
-    jwt: &PartnerJwt,
+    jwt: Option<&PartnerJwt>,
     deposit_address: &str,
 ) -> Result<(ExecutionStatus, Vec<u8>), String> {
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("depositAddress", deposit_address)
         .finish();
-    let raw = request(
-        host,
-        "GET",
-        &format!("/v0/status?{query}"),
-        Some(jwt),
-        vec![],
-    )?;
+    let raw = request(host, "GET", &format!("/v0/status?{query}"), jwt, vec![])?;
     let status = crate::api_types::from_slice_no_duplicates(&raw)
         .map_err(|e| format!("status response: {e}"))?;
     Ok((status, raw))

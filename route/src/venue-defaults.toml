@@ -1,0 +1,42 @@
+# NEAR Intents venue policy, owned by this Petal and editable per wallet at
+# settings/wallets/<wallet>/venue.toml. These are the defaults a wallet gets
+# until it writes its own file; they are advisory guard rails, not custody.
+# Bloom's wallet policy still decides what may be signed, and every deposit
+# transaction is approved by the owner.
+
+[venue]
+enabled = true
+
+[limits]
+# A swap's requested slippage may not exceed this.
+max_slippage_bps = 100
+# Largest input per swap, in the venue's own USD valuation of the amount in.
+# The venue reports this price; use limits.max_input_units for a cap that does
+# not depend on it.
+max_input_usd = "250"
+
+# Exact caps in an asset's smallest units, keyed by 1Click asset id. Checked
+# against the signed quote's amountIn, so they hold whatever the venue prices.
+[limits.max_input_units]
+
+[recipients]
+# Where a swap may pay out. "class:wallet_address" is this wallet's own EVM
+# address. Literal addresses may be added, which is how a custodian pins payouts
+# to a treasury; a destination chain whose address form differs from the EVM one
+# needs its address listed here explicitly.
+allowed = ["class:wallet_address"]
+
+[chains]
+# Bloom chain names a swap may spend from. Empty means every chain this Petal
+# maps.
+allowed_origin = []
+# 1Click blockchain codes a swap may pay out to (for example "arb", "sol",
+# "near"). Empty means any chain the venue supports.
+allowed_destination = []
+
+[solvers]
+# Deposit addresses a signed quote may name. Empty means any, which is the
+# default: 1Click issues a fresh deposit address per quote and does not tell the
+# client which solver is behind it, so listing addresses only works with a venue
+# that issues stable ones.
+allowed_deposit_addresses = []
